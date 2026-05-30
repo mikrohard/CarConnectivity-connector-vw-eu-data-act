@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "carconnectivity-connector-vw-eu-data-act"
-version = "0.1.1"
+version = "0.1.2"
 description = "CarConnectivity connector for the Volkswagen EU Data Act portal (read-only)"
 requires-python = ">=3.9"
 authors = [

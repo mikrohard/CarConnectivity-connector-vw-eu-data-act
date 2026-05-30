@@ -207,13 +207,18 @@ class Connector(BaseConnector):
                 LOG.error('Retrieval error during update (%s). Will try again after %ss', str(err), interval)
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
                 self._stop_event.wait(interval)
-            except Exception as err:
-                LOG.critical('Critical error during update: %s', traceback.format_exc())
+            except Exception:  # pylint: disable=broad-exception-caught
+                # Never let an unexpected error kill the polling thread: log it,
+                # mark unhealthy, and retry on the next interval so the connector
+                # self-heals once the underlying issue clears.
+                LOG.critical('Unexpected error during update (will retry in %ss): %s', interval, traceback.format_exc())
                 self.healthy._set_value(value=False)  # pylint: disable=protected-access
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
-                raise err
+                self._stop_event.wait(interval)
             else:
                 self.connection_state._set_value(value=ConnectionState.CONNECTED)  # pylint: disable=protected-access
+                if self.healthy.value is not True:
+                    self.healthy._set_value(value=True)  # pylint: disable=protected-access
                 self._stop_event.wait(interval)
         self.connection_state._set_value(value=ConnectionState.DISCONNECTED)  # pylint: disable=protected-access
 

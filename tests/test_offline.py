@@ -15,6 +15,9 @@ from carconnectivity.doors import Doors
 from carconnectivity.observable import Observable
 from carconnectivity.window_heating import WindowHeatings
 
+import requests
+
+from carconnectivity_connectors.vw_eu_data_act.client import ApiError, EudaApiClient
 from carconnectivity_connectors.vw_eu_data_act.connector import Connector
 from carconnectivity_connectors.vw_eu_data_act.dataset import Dataset
 from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
@@ -118,3 +121,21 @@ def test_update_vehicles_flushes_transaction(connector):
     # The on_transaction_end observer fired (discovery would be (re)published).
     assert fired, "transaction_end() was not called; HA discovery would not refresh"
     assert garage.get_vehicle(VIN).odometer.value == 116803
+
+
+def test_network_errors_become_apierror():
+    """Transient requests failures must surface as ApiError (which the background
+    loop retries), not raw ConnectionError (which crashed the worker thread)."""
+    client = EudaApiClient(email="u", password="p")
+    client._logged_in = True  # skip login for this unit test
+
+    def _boom(*args, **kwargs):
+        raise requests.exceptions.ConnectionError(
+            "('Connection aborted.', RemoteDisconnected(...))")
+
+    client._session.get = _boom
+
+    with pytest.raises(ApiError):
+        client.list_datasets("WVWZZZE1ZLP010257", "ident")
+    with pytest.raises(ApiError):
+        client.download_dataset("WVWZZZE1ZLP010257", "ident", "x.zip")

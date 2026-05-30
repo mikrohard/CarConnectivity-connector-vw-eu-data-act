@@ -19,6 +19,8 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 LOG: logging.Logger = logging.getLogger("carconnectivity.connectors.vw_eu_data_act-api-debug")
 
@@ -196,6 +198,16 @@ class EudaApiClient:
                  timeout: int = 60) -> None:
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": USER_AGENT})
+        # Retry transient connection/5xx errors at the transport layer so a single
+        # dropped connection (the portal/Azure blob occasionally closes idle
+        # sockets) does not bubble up as a hard failure.
+        retry = Retry(total=3, connect=3, read=3, backoff_factor=1.0,
+                      status_forcelist=(500, 502, 503, 504),
+                      allowed_methods=frozenset(["GET", "POST"]),
+                      raise_on_status=False)
+        adapter = HTTPAdapter(max_retries=retry)
+        self._session.mount("https://", adapter)
+        self._session.mount("http://", adapter)
         self._email = email
         self._password = password
         self._state = f"{country}__{language}__{brand}"
@@ -319,8 +331,20 @@ class EudaApiClient:
 
     # -- authenticated requests -------------------------------------------
 
+    def _session_get(self, url: str, *, headers: Optional[dict] = None):
+        """GET wrapper that translates transport errors into ApiError.
+
+        Transient network failures (dropped connections, timeouts, DNS) must be
+        surfaced as ApiError so the connector's background loop retries on its
+        interval instead of crashing the worker thread.
+        """
+        try:
+            return self._session.get(url, headers=headers, timeout=self._timeout)
+        except requests.RequestException as err:
+            raise ApiError(f"Network error for GET {url}: {err}") from err
+
     def _get_json(self, url: str, *, headers: Optional[dict] = None, _retry: bool = True):
-        resp = self._session.get(url, headers=headers, timeout=self._timeout)
+        resp = self._session_get(url, headers=headers)
         if resp.status_code in (401, 403) and _retry:
             LOG.debug("Session expired (%s) for %s; re-authenticating", resp.status_code, url)
             self._logged_in = False
@@ -379,11 +403,11 @@ class EudaApiClient:
             raise ApiError(f"{name} contains no content")
         url = f"{BASE_URL}{DOWNLOAD_PATH.format(vin=vin, identifier=identifier)}"
         headers = {"filename": name, "type": "partial"}
-        resp = self._session.get(url, headers=headers, timeout=self._timeout)
+        resp = self._session_get(url, headers=headers)
         if resp.status_code in (401, 403):
             self._logged_in = False
             self.login()
-            resp = self._session.get(url, headers=headers, timeout=self._timeout)
+            resp = self._session_get(url, headers=headers)
         if resp.status_code >= 400:
             raise ApiError(f"Download {name} -> HTTP {resp.status_code}")
         return self._unzip_json(resp.content, name)
