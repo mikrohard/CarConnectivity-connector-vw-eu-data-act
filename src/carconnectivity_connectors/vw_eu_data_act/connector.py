@@ -110,8 +110,13 @@ class Connector(BaseConnector):
 
     def __init__(self, connector_id: str, car_connectivity: CarConnectivity, config: Dict, *args,
                  initialization: Optional[Dict] = None, **kwargs) -> None:
+        # ``initialization`` is accepted because newer carconnectivity cores pass
+        # it when loading connectors, but it is deliberately NOT forwarded to
+        # BaseConnector: on those cores the base __init__ chain does not accept it
+        # and raises "TypeError: ...__init__() got an unexpected keyword argument
+        # 'initialization'". It is not needed for this read-only connector. (#1)
         BaseConnector.__init__(self, connector_id=connector_id, car_connectivity=car_connectivity, config=config,
-                               log=LOG, api_log=LOG_API, *args, initialization=initialization, **kwargs)
+                               log=LOG, api_log=LOG_API, *args, **kwargs)
 
         self._background_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()

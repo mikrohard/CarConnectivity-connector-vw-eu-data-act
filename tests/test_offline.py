@@ -190,6 +190,19 @@ def test_mileage_unit_defaults_to_km_when_absent(connector):
     assert garage.get_vehicle(VIN).odometer.unit == Length.KM
 
 
+def test_connector_accepts_initialization_kwarg():
+    """Newer carconnectivity cores pass an ``initialization`` kwarg when loading
+    connectors. The connector must accept it without raising (issue #1):
+    previously it forwarded the kwarg to a base __init__ that rejects it,
+    raising "TypeError: ...__init__() got an unexpected keyword argument
+    'initialization'"."""
+    cc = CarConnectivity(config={"carConnectivity": {"connectors": []}})
+    conn = Connector(connector_id="test-init", car_connectivity=cc,
+                     config={"username": "user@example.com", "password": "secret"},
+                     initialization={})
+    assert conn is not None
+
+
 def test_network_errors_become_apierror():
     """Transient requests failures must surface as ApiError (which the background
     loop retries), not raw ConnectionError (which crashed the worker thread)."""
