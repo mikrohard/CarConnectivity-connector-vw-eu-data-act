@@ -12,6 +12,7 @@ import pytest
 from carconnectivity.carconnectivity import CarConnectivity
 from carconnectivity.charging import Charging
 from carconnectivity.doors import Doors
+from carconnectivity.observable import Observable
 from carconnectivity.window_heating import WindowHeatings
 
 from carconnectivity_connectors.vw_eu_data_act.connector import Connector
@@ -79,3 +80,41 @@ def test_mapping(connector):
     assert vehicle.charging.settings.target_level.value == 80
     # estimated range is absent from this dataset -> stays unset
     assert drive.range.value is None
+
+
+def test_update_vehicles_flushes_transaction(connector):
+    """update_vehicles() must call transaction_end() so the mqtt_homeassistant
+    plugin's on_transaction_end discovery observer fires. Without it, HA entities
+    stay 'unavailable'. This guards against regressing that fix."""
+    cc = connector.car_connectivity
+    garage = cc.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    # An on_transaction_end ENABLED observer (same registration the HA plugin uses).
+    fired = []
+    cc.add_observer(lambda element, flags: fired.append(flags),
+                    Observable.ObserverEvent.ENABLED,
+                    on_transaction_end=True)
+
+    # Stub the API client so update_vehicles() runs fully offline.
+    payload = json.load(open(SAMPLE, "r", encoding="utf-8"))
+
+    class _FakeClient:
+        def get_metadata(self, vin):
+            return {"Identifier": "ident"}
+
+        def list_datasets(self, vin, identifier):
+            return [{"name": "20260530104136_%s.zip" % vin,
+                     "createdOn": "2026-05-30T10:41:36Z"}]
+
+        def download_dataset(self, vin, identifier, name):
+            return payload
+
+    connector.client = _FakeClient()
+
+    connector.update_vehicles()
+
+    # The on_transaction_end observer fired (discovery would be (re)published).
+    assert fired, "transaction_end() was not called; HA discovery would not refresh"
+    assert garage.get_vehicle(VIN).odometer.value == 116803

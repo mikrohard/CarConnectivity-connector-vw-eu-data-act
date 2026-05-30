@@ -272,6 +272,10 @@ class Connector(BaseConnector):
             if newest_created is not None:
                 next_polls.append(newest_created + DATASET_INTERVAL + POST_DATASET_BUFFER)
         self._reschedule(next_polls)
+        # Flush accumulated notifications so on_transaction_end observers (e.g. the
+        # mqtt_homeassistant plugin's discovery publisher) fire. Without this, newly
+        # enabled attributes are never announced and HA entities stay "unavailable".
+        self.car_connectivity.transaction_end()
 
     def _update_vehicle(self, vin: str) -> "Optional[datetime]":
         """Fetch and map the newest dataset for ``vin``; return its createdOn."""
