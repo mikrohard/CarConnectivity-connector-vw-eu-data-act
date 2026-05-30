@@ -1,4 +1,6 @@
 # Python
+# _version.py is generated at build time by setuptools_scm (see pyproject.toml)
+_version.py
 __pycache__/
 *.py[cod]
 *.egg-info/

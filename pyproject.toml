@@ -1,13 +1,14 @@
 [build-system]
 requires = [
-    "setuptools>=61.0"
+    "setuptools>=61.0",
+    "setuptools_scm>=8"
 ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "carconnectivity-connector-vw-eu-data-act"
-version = "0.1.2"
 description = "CarConnectivity connector for the Volkswagen EU Data Act portal (read-only)"
+dynamic = ["version"]
 requires-python = ">=3.9"
 authors = [
     { name = "Jernej Fijacko" }
@@ -18,6 +19,9 @@ dependencies = [
 ]
 readme = "README.md"
 license = "MIT"
+license-files = [
+    "LICENSE",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -31,9 +35,16 @@ classifiers = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/mikrohard/CarConnectivity-connector-vw-eu-data-act"
+Repository = "https://github.com/mikrohard/CarConnectivity-connector-vw-eu-data-act"
+Issues = "https://github.com/mikrohard/CarConnectivity-connector-vw-eu-data-act/issues"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools_scm]
+write_to = "src/carconnectivity_connectors/vw_eu_data_act/_version.py"
+
 [tool.pylint.format]
 max-line-length=160
+ignore-patterns= "_version.py"
