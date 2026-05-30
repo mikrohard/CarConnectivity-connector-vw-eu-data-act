@@ -1,0 +1,412 @@
+"""CarConnectivity connector for the Volkswagen EU Data Act portal.
+
+Volkswagen blocked WeConnect API access for 3rd-party integrations. The EU Data
+Act portal is the remaining personal-use access path. It delivers a batch
+dataset roughly every 15 minutes, is strictly read-only (no commands), and
+omits some data points (e.g. GPS location). This connector authenticates
+against the portal, downloads the newest dataset per vehicle, and maps the
+available data points onto native CarConnectivity attributes as read-only
+values.
+"""
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+import logging
+import netrc
+import os
+import threading
+import traceback
+from datetime import datetime, timedelta, timezone
+
+from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
+from carconnectivity.util import config_remove_credentials
+from carconnectivity.units import Length, Power, Temperature
+from carconnectivity.attributes import DurationAttribute, EnumAttribute
+from carconnectivity.vehicle import GenericVehicle
+from carconnectivity.drive import ElectricDrive, GenericDrive
+from carconnectivity.battery import Battery
+from carconnectivity.charging import Charging
+from carconnectivity.doors import Doors
+from carconnectivity.window_heating import WindowHeatings
+from carconnectivity.enums import ConnectionState
+
+from carconnectivity_connectors.base.connector import BaseConnector
+from carconnectivity_connectors.vw_eu_data_act._version import __version__
+from carconnectivity_connectors.vw_eu_data_act.client import (
+    DEFAULT_BRAND, DEFAULT_COUNTRY, DEFAULT_LANGUAGE, NO_CONTENT_SUFFIX,
+    ApiError, AuthError, EudaApiClient,
+)
+from carconnectivity_connectors.vw_eu_data_act.dataset import Dataset, parse_timestamp
+from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
+
+if TYPE_CHECKING:
+    from typing import Any, Dict, List, Optional
+    from carconnectivity.carconnectivity import CarConnectivity
+    from carconnectivity.garage import Garage
+
+LOG: logging.Logger = logging.getLogger("carconnectivity.connectors.vw_eu_data_act")
+LOG_API: logging.Logger = logging.getLogger("carconnectivity.connectors.vw_eu_data_act-api-debug")
+
+# Datasets land ~every 15 min; refresh shortly after the next expected drop.
+DATASET_INTERVAL = timedelta(minutes=15)
+POST_DATASET_BUFFER = timedelta(seconds=45)
+RETRY_INTERVAL = timedelta(minutes=1)
+MIN_INTERVAL = timedelta(seconds=60)
+
+# Map the portal's charge-state enum to the generic CarConnectivity enum.
+CHARGE_STATE_MAPPING: "Dict[str, Charging.ChargingState]" = {
+    'CHARGE_STATE_OFF': Charging.ChargingState.OFF,
+    'CHARGE_STATE_NOT_READY_FOR_CHARGING': Charging.ChargingState.OFF,
+    'CHARGE_STATE_READY_FOR_CHARGING': Charging.ChargingState.READY_FOR_CHARGING,
+    'CHARGE_STATE_CHARGING': Charging.ChargingState.CHARGING,
+    'CHARGE_STATE_CONSERVATION': Charging.ChargingState.CONSERVATION,
+    'CHARGE_STATE_CHARGE_PURPOSE_REACHED_NOT_CONSERVATION_CHARGING': Charging.ChargingState.OFF,
+    'CHARGE_STATE_CHARGE_PURPOSE_REACHED_CONSERVATION': Charging.ChargingState.CONSERVATION,
+    'CHARGE_STATE_ERROR': Charging.ChargingState.ERROR,
+    'CHARGE_STATE_DISCHARGING': Charging.ChargingState.DISCHARGING,
+    'CHARGE_STATE_INVALID': Charging.ChargingState.UNKNOWN,
+}
+
+WINDOW_HEATING_MAPPING: "Dict[str, WindowHeatings.HeatingState]" = {
+    'WINDOW_HEATING_STATE_OFF': WindowHeatings.HeatingState.OFF,
+    'WINDOW_HEATING_STATE_ON': WindowHeatings.HeatingState.ON,
+    'WINDOW_HEATING_STATE_INVALID': WindowHeatings.HeatingState.INVALID,
+}
+
+
+def _filename_timestamp(name: str) -> "Optional[datetime]":
+    """Parse the leading YYYYMMDDhhmmss in a dataset filename."""
+    stem = name.split("_", 1)[0]
+    try:
+        return datetime.strptime(stem, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _created_on(entry: dict) -> "Optional[datetime]":
+    """Return the createdOn timestamp of a dataset listing entry."""
+    raw = entry.get("createdOn")
+    if not raw:
+        return _filename_timestamp(entry.get("name", ""))
+    parsed = parse_timestamp(raw)
+    return parsed if parsed is not None else _filename_timestamp(entry.get("name", ""))
+
+
+class Connector(BaseConnector):
+    """Read-only connector for the Volkswagen EU Data Act portal."""
+
+    def __init__(self, connector_id: str, car_connectivity: CarConnectivity, config: Dict, *args,
+                 initialization: Optional[Dict] = None, **kwargs) -> None:
+        BaseConnector.__init__(self, connector_id=connector_id, car_connectivity=car_connectivity, config=config,
+                               log=LOG, api_log=LOG_API, *args, initialization=initialization, **kwargs)
+
+        self._background_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+        # Per-VIN data-request identifier, resolved lazily from the metadata endpoint.
+        self._identifiers: Dict[str, str] = {}
+
+        self.connection_state: EnumAttribute[ConnectionState] = EnumAttribute(
+            name="connection_state", parent=self, value_type=ConnectionState,
+            value=ConnectionState.DISCONNECTED, tags={'connector_custom'})
+        self.interval: DurationAttribute = DurationAttribute(name="interval", parent=self, tags={'connector_custom'})
+        self.interval.minimum = MIN_INTERVAL
+        self.interval._is_changeable = True  # pylint: disable=protected-access
+
+        LOG.info("Loading vw_eu_data_act connector with config %s", config_remove_credentials(config))
+
+        # --- credentials (config dict or .netrc) ---
+        self.active_config['username'] = None
+        self.active_config['password'] = None
+        if 'username' in config and 'password' in config:
+            self.active_config['username'] = config['username']
+            self.active_config['password'] = config['password']
+        else:
+            if 'netrc' in config:
+                self.active_config['netrc'] = config['netrc']
+            else:
+                self.active_config['netrc'] = os.path.join(os.path.expanduser("~"), ".netrc")
+            try:
+                secrets = netrc.netrc(file=self.active_config['netrc'])
+                secret = secrets.authenticators("vw_eu_data_act")
+                if secret is None:
+                    raise AuthenticationError(
+                        f'Authentication using {self.active_config["netrc"]} failed: vw_eu_data_act not found in netrc')
+                self.active_config['username'], _, self.active_config['password'] = secret
+            except netrc.NetrcParseError as err:
+                raise AuthenticationError(f'Authentication using {self.active_config["netrc"]} failed: {err}') from err
+            except FileNotFoundError as err:
+                raise AuthenticationError(
+                    f'{self.active_config["netrc"]} netrc-file was not found. '
+                    'Create it or provide username and password in config') from err
+
+        if self.active_config['username'] is None or self.active_config['password'] is None:
+            raise AuthenticationError('Username or password not provided')
+
+        # --- interval ---
+        self.active_config['interval'] = 900
+        if 'interval' in config and config['interval'] is not None:
+            self.active_config['interval'] = config['interval']
+            if self.active_config['interval'] < MIN_INTERVAL.total_seconds():
+                raise ValueError(f'Interval must be at least {int(MIN_INTERVAL.total_seconds())} seconds')
+        self.interval._set_value(timedelta(seconds=self.active_config['interval']))  # pylint: disable=protected-access
+
+        # --- OIDC state (country/language/brand) ---
+        self.active_config['country'] = config.get('country', DEFAULT_COUNTRY)
+        self.active_config['language'] = config.get('language', DEFAULT_LANGUAGE)
+        self.active_config['brand'] = config.get('brand', DEFAULT_BRAND)
+
+        # --- hidden VINs ---
+        if 'hide_vins' in config and config['hide_vins'] is not None:
+            self.active_config['hide_vins'] = config['hide_vins']
+        else:
+            self.active_config['hide_vins'] = []
+
+        # Optional explicit VIN allow-list (otherwise all consented vehicles are used).
+        self.active_config['vin'] = config.get('vin')
+
+        self.client: EudaApiClient = EudaApiClient(
+            email=self.active_config['username'], password=self.active_config['password'],
+            country=self.active_config['country'], language=self.active_config['language'],
+            brand=self.active_config['brand'])
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def startup(self) -> None:
+        self._background_thread = threading.Thread(target=self._background_loop, daemon=False)
+        self._background_thread.name = 'carconnectivity.connectors.vw_eu_data_act-background'
+        self._background_thread.start()
+        self.healthy._set_value(value=True)  # pylint: disable=protected-access
+
+    def _background_loop(self) -> None:
+        self._stop_event.clear()
+        fetch: bool = True
+        self.connection_state._set_value(value=ConnectionState.CONNECTING)  # pylint: disable=protected-access
+        while not self._stop_event.is_set():
+            interval: float = self.active_config['interval']
+            try:
+                try:
+                    if fetch:
+                        self.fetch_all()
+                        fetch = False
+                    else:
+                        self.update_vehicles()
+                    self.last_update._set_value(value=datetime.now(tz=timezone.utc))  # pylint: disable=protected-access
+                    if self.interval.value is not None:
+                        interval = self.interval.value.total_seconds()
+                except Exception:
+                    self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
+                    if self.interval.value is not None:
+                        interval = self.interval.value.total_seconds()
+                    raise
+            except TooManyRequestsError as err:
+                LOG.error('Too many requests from your account (%s). Will try again after 15 minutes', str(err))
+                self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
+                self._stop_event.wait(900)
+            except (RetrievalError, ApiError) as err:
+                LOG.error('Retrieval error during update (%s). Will try again after %ss', str(err), interval)
+                self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
+                self._stop_event.wait(interval)
+            except Exception as err:
+                LOG.critical('Critical error during update: %s', traceback.format_exc())
+                self.healthy._set_value(value=False)  # pylint: disable=protected-access
+                self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
+                raise err
+            else:
+                self.connection_state._set_value(value=ConnectionState.CONNECTED)  # pylint: disable=protected-access
+                self._stop_event.wait(interval)
+        self.connection_state._set_value(value=ConnectionState.DISCONNECTED)  # pylint: disable=protected-access
+
+    def shutdown(self) -> None:
+        for vehicle in self.car_connectivity.garage.list_vehicles():
+            if len(vehicle.managing_connectors) == 1 and self in vehicle.managing_connectors:
+                self.car_connectivity.garage.remove_vehicle(vehicle.id)
+                vehicle.enabled = False
+        self._stop_event.set()
+        self.client.close()
+        if self._background_thread is not None:
+            self._background_thread.join()
+        BaseConnector.shutdown(self)
+
+    # -- fetching ----------------------------------------------------------
+
+    def fetch_all(self) -> None:
+        """Discover vehicles from the portal, then update them."""
+        garage: Garage = self.car_connectivity.garage
+        vehicles: List[dict] = self.client.list_vehicles()
+        seen_vins: set[str] = set()
+        allow_vins = {self.active_config['vin']} if self.active_config['vin'] else None
+        for veh in vehicles:
+            vin = veh.get('vin')
+            if vin is None:
+                continue
+            if vin in self.active_config['hide_vins']:
+                LOG.info('Vehicle %s filtered out due to configuration', vin)
+                continue
+            if allow_vins is not None and vin not in allow_vins:
+                continue
+            seen_vins.add(vin)
+            vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)  # pyright: ignore[reportAssignmentType]
+            if vehicle is None:
+                vehicle = VWEudaVehicle(vin=vin, garage=garage, managing_connector=self,
+                                        initialization=garage.get_initialization(vin))
+                garage.add_vehicle(vin, vehicle)
+            if veh.get('nickname'):
+                vehicle.name._set_value(veh['nickname'])  # pylint: disable=protected-access
+        # Remove vehicles no longer present that are managed solely by us.
+        for vin in set(garage.list_vehicle_vins()) - seen_vins:
+            vehicle_to_remove = garage.get_vehicle(vin)
+            if vehicle_to_remove is not None and vehicle_to_remove.is_managed_by_connector(self):
+                garage.remove_vehicle(vin)
+        self.update_vehicles()
+
+    def update_vehicles(self) -> None:
+        """Download the newest dataset for each managed vehicle and map it."""
+        garage: Garage = self.car_connectivity.garage
+        next_polls: List[datetime] = []
+        for vin in garage.list_vehicle_vins():
+            vehicle = garage.get_vehicle(vin)
+            if vehicle is None or not vehicle.is_managed_by_connector(self):
+                continue
+            newest_created = self._update_vehicle(vin)
+            if newest_created is not None:
+                next_polls.append(newest_created + DATASET_INTERVAL + POST_DATASET_BUFFER)
+        self._reschedule(next_polls)
+
+    def _update_vehicle(self, vin: str) -> "Optional[datetime]":
+        """Fetch and map the newest dataset for ``vin``; return its createdOn."""
+        identifier = self._identifiers.get(vin)
+        if identifier is None:
+            meta = self.client.get_metadata(vin)
+            identifier = meta.get('Identifier')
+            if not identifier:
+                LOG.warning('No data-request identifier for vehicle %s; skipping', vin)
+                return None
+            self._identifiers[vin] = identifier
+
+        listing = self.client.list_datasets(vin, identifier)
+        content = sorted(
+            (e for e in listing if e.get('name') and not e['name'].endswith(NO_CONTENT_SUFFIX)),
+            key=lambda e: _created_on(e) or datetime.min.replace(tzinfo=timezone.utc),
+        )
+        if not content:
+            LOG.debug('No content datasets available yet for %s', vin)
+            return None
+        newest = content[-1]
+        payload = self.client.download_dataset(vin, identifier, newest['name'])
+        dataset = Dataset.from_json(payload)
+        self._map_dataset(vin, dataset)
+        return _created_on(newest)
+
+    # -- mapping -----------------------------------------------------------
+
+    def _map_dataset(self, vin: str, dataset: Dataset) -> None:
+        """Map an EU Data Act dataset onto native CarConnectivity attributes (read-only)."""
+        garage: Garage = self.car_connectivity.garage
+        vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)  # pyright: ignore[reportAssignmentType]
+        if vehicle is None:
+            return
+        captured_at = dataset.captured_at
+
+        # Promote to an electric vehicle once we see EV-specific data.
+        is_ev = dataset.by_field('battery_state_report.soc') is not None \
+            or dataset.by_field('battery_state_report.charge_power') is not None \
+            or dataset.by_field('charging_state_report.current_charge_state') is not None
+        if is_ev and not isinstance(vehicle, VWEudaElectricVehicle):
+            LOG.debug('Promoting %s to VWEudaElectricVehicle for %s', vehicle.__class__.__name__, vin)
+            vehicle = VWEudaElectricVehicle(garage=garage, origin=vehicle)
+            garage.replace_vehicle(vin, vehicle)
+            vehicle.type._set_value(GenericVehicle.Type.ELECTRIC)  # pylint: disable=protected-access
+
+        # Odometer (mileage.value, km)
+        mileage = dataset.value_of('mileage.value')
+        if mileage is not None:
+            vehicle.odometer._set_value(value=mileage, measured=captured_at, unit=Length.KM)  # pylint: disable=protected-access
+            vehicle.odometer.precision = 1
+
+        # Doors lock state
+        locked = dataset.value_of('locked')
+        if isinstance(locked, bool):
+            vehicle.doors.lock_state._set_value(  # pylint: disable=protected-access
+                Doors.LockState.LOCKED if locked else Doors.LockState.UNLOCKED, measured=captured_at)
+
+        # Window heating state
+        wh = dataset.value_of('window_heating_state')
+        if isinstance(wh, str):
+            vehicle.window_heatings.heating_state._set_value(  # pylint: disable=protected-access
+                WINDOW_HEATING_MAPPING.get(wh, WindowHeatings.HeatingState.UNKNOWN), measured=captured_at)
+
+        if isinstance(vehicle, VWEudaElectricVehicle):
+            self._map_electric(vehicle, dataset, captured_at)
+
+    def _map_electric(self, vehicle: VWEudaElectricVehicle, dataset: Dataset,
+                      captured_at: "Optional[datetime]") -> None:
+        """Map EV-specific fields (SoC, charging, battery temps, range)."""
+        drive = vehicle.get_electric_drive()
+        if drive is None:
+            drive = ElectricDrive(drive_id='primary', drives=vehicle.drives,
+                                  initialization=vehicle.drives.get_initialization('primary'))
+            drive.type._set_value(GenericDrive.Type.ELECTRIC)  # pylint: disable=protected-access
+            vehicle.drives.add_drive(drive)
+
+        # State of charge -> drive level (%)
+        soc = dataset.value_of('battery_state_report.soc')
+        if soc is not None:
+            drive.level._set_value(value=soc, measured=captured_at)  # pylint: disable=protected-access
+            drive.level.precision = 1
+
+        # Estimated range (km) - frequently absent from EU Data Act datasets.
+        drive_range = dataset.value_of('range')
+        if drive_range is not None:
+            drive.range._set_value(value=drive_range, measured=captured_at, unit=Length.KM)  # pylint: disable=protected-access
+            drive.range.precision = 1
+
+        # Battery temperature min/max (°C)
+        battery: Battery = drive.battery
+        tmin = dataset.value_of('min_temperature')
+        if tmin is not None:
+            battery.temperature_min._set_value(value=tmin, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
+        tmax = dataset.value_of('max_temperature')
+        if tmax is not None:
+            battery.temperature_max._set_value(value=tmax, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
+
+        # Charging power (kW)
+        power = dataset.value_of('battery_state_report.charge_power')
+        if power is not None:
+            vehicle.charging.power._set_value(value=power, measured=captured_at, unit=Power.KW)  # pylint: disable=protected-access
+
+        # Charging state
+        charge_state = dataset.value_of('charging_state_report.current_charge_state')
+        if isinstance(charge_state, str):
+            vehicle.charging.state._set_value(  # pylint: disable=protected-access
+                CHARGE_STATE_MAPPING.get(charge_state, Charging.ChargingState.UNKNOWN), measured=captured_at)
+
+        # Target state of charge (%) - read-only here (no commands possible).
+        target_soc = dataset.value_of('settings.target_soc')
+        if target_soc is not None:
+            vehicle.charging.settings.target_level._set_value(value=target_soc, measured=captured_at)  # pylint: disable=protected-access
+
+    # -- scheduling --------------------------------------------------------
+
+    def _reschedule(self, next_polls: "List[datetime]") -> None:
+        """Set the next interval ~15 min after the newest dataset, else short retry."""
+        if next_polls:
+            target = min(next_polls)
+            delta = target - datetime.now(tz=timezone.utc)
+            if delta > MIN_INTERVAL:
+                self.interval._set_value(delta)  # pylint: disable=protected-access
+                LOG.debug('Next refresh in %s', delta)
+                return
+        self.interval._set_value(RETRY_INTERVAL)  # pylint: disable=protected-access
+        LOG.debug('Next dataset overdue; retrying in %s', RETRY_INTERVAL)
+
+    # -- metadata ----------------------------------------------------------
+
+    def get_version(self) -> str:
+        return __version__
+
+    def get_type(self) -> str:
+        return "carconnectivity-connector-vw-eu-data-act"
+
+    def get_name(self) -> str:
+        return "Volkswagen EU Data Act Connector"

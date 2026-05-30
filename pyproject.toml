@@ -1,0 +1,39 @@
+[build-system]
+requires = [
+    "setuptools>=61.0"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "carconnectivity-connector-vw-eu-data-act"
+version = "0.1.0"
+description = "CarConnectivity connector for the Volkswagen EU Data Act portal (read-only)"
+requires-python = ">=3.9"
+authors = [
+    { name = "Jernej Fijacko" }
+]
+dependencies = [
+    "carconnectivity>=0.11.9",
+    "requests~=2.32"
+]
+readme = "README.md"
+license = "MIT"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Libraries"
+]
+
+[project.urls]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pylint.format]
+max-line-length=160
