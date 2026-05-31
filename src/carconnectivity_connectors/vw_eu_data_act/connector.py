@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
-from carconnectivity.units import Length, Power, Temperature
+from carconnectivity.units import Length, Power, Speed, Temperature
 from carconnectivity.attributes import DurationAttribute, EnumAttribute
 from carconnectivity.vehicle import GenericVehicle
 from carconnectivity.drive import ElectricDrive, GenericDrive
@@ -40,11 +40,13 @@ from carconnectivity_connectors.vw_eu_data_act.client import (
     DEFAULT_BRAND, DEFAULT_COUNTRY, DEFAULT_LANGUAGE, NO_CONTENT_SUFFIX,
     ApiError, AuthError, EudaApiClient,
 )
-from carconnectivity_connectors.vw_eu_data_act.dataset import Dataset, parse_timestamp, resolve_distance_unit
+from carconnectivity_connectors.vw_eu_data_act.dataset import (
+    Dataset, parse_timestamp, resolve_charge_rate_unit, resolve_distance_unit,
+)
 from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, List, Optional
+    from typing import Any, Dict, List, Optional, Tuple
     from carconnectivity.carconnectivity import CarConnectivity
     from carconnectivity.garage import Garage
 
@@ -85,6 +87,30 @@ WINDOW_HEATING_MAPPING: "Dict[str, WindowHeatings.HeatingState]" = {
     'WINDOW_HEATING_STATE_ON': WindowHeatings.HeatingState.ON,
     'WINDOW_HEATING_STATE_INVALID': WindowHeatings.HeatingState.INVALID,
 }
+
+# Map the portal's charge-type enum (what the car is plugged into) to the
+# generic CarConnectivity charging-type enum.
+CHARGE_TYPE_MAPPING: "Dict[str, Charging.ChargingType]" = {
+    'CHARGE_TYPE_INVALID': Charging.ChargingType.INVALID,
+    'CHARGE_TYPE_OFF': Charging.ChargingType.OFF,
+    'CHARGE_TYPE_AC': Charging.ChargingType.AC,
+    'CHARGE_TYPE_DC': Charging.ChargingType.DC,
+}
+
+
+def _charge_rate_per_hour(value: float, unit_enum) -> "Tuple[float, Speed]":
+    """Normalise a portal charge rate to a per-hour speed.
+
+    The portal reports the charge rate as range gained over time; the companion
+    ``charge_rate_unit`` enum says whether that is km or miles and per hour or
+    per minute. The native SpeedAttribute is per-hour only, so per-minute rates
+    are scaled by 60. Defaults to km/h when the unit is absent/unrecognised.
+    """
+    resolved = resolve_charge_rate_unit(unit_enum)
+    distance, per_minute = resolved if resolved is not None else ("km", False)
+    if per_minute:
+        value = value * 60
+    return value, Speed.MPH if distance == "mi" else Speed.KMH
 
 
 def _filename_timestamp(name: str) -> "Optional[datetime]":
@@ -230,6 +256,13 @@ class Connector(BaseConnector):
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
                 self._stop_event.wait(900)
             except (RetrievalError, ApiError) as err:
+                # A failed poll (transient network/DNS blip, a stale data-request
+                # identifier, etc.) should recover on the next short cycle rather
+                # than freezing the data for the full ~15-min cadence: retry within
+                # ~1 min. The next successful update reschedules to the normal
+                # cadence via _reschedule(). (HA f129ebc)
+                interval = RETRY_INTERVAL.total_seconds()
+                self.interval._set_value(RETRY_INTERVAL)  # pylint: disable=protected-access
                 LOG.error('Retrieval error during update (%s). Will try again after %ss', str(err), interval)
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
                 self._stop_event.wait(interval)
@@ -308,18 +341,69 @@ class Connector(BaseConnector):
         # enabled attributes are never announced and HA entities stay "unavailable".
         self.car_connectivity.transaction_end()
 
+    def _refresh_identifier(self, vin: str) -> "Optional[str]":
+        """(Re-)fetch the data-request identifier from the metadata endpoint.
+
+        Returns the identifier and updates the cache when the portal hands out a
+        *new* one (e.g. after the continuous data subscription was deleted and
+        recreated, which assigns a fresh identifier and silently invalidates the
+        stored one). Returns ``None`` when it is unavailable or unchanged.
+        """
+        try:
+            meta = self.client.get_metadata(vin)
+        except ApiError as err:
+            LOG.debug('Could not refresh data-request identifier for %s: %s', vin, err)
+            return None
+        new_id = meta.get('Identifier') or meta.get('identifier')
+        if not new_id or new_id == self._identifiers.get(vin):
+            return None
+        if vin in self._identifiers:
+            LOG.warning('Data-request identifier for %s changed (%s -> %s); the portal '
+                        'subscription was likely recreated. Using the new identifier.',
+                        vin, self._identifiers[vin], new_id)
+        self._identifiers[vin] = new_id
+        return new_id
+
+    def _list_datasets_with_refresh(self, vin: str, identifier: str) -> "Tuple[List[dict], str]":
+        """List datasets, self-healing a stale identifier once if needed.
+
+        A recreated subscription makes the stored identifier stale: the listing
+        then errors or comes back empty. On either signal, re-fetch the
+        identifier and retry once before giving up, so the connector recovers
+        automatically on the next cycle without a manual reload. The metadata
+        call only happens on that failure/empty signal, so there is no extra API
+        load in normal operation. (HA 2c979c7, issue #13)
+        """
+        listing: "List[dict]" = []
+        for retried in (False, True):
+            try:
+                listing = self.client.list_datasets(vin, identifier)
+            except ApiError:
+                if not retried:
+                    new_id = self._refresh_identifier(vin)
+                    if new_id is not None:
+                        identifier = new_id
+                        continue
+                raise
+            # An empty listing can also mean the subscription was recreated.
+            if not listing and not retried:
+                new_id = self._refresh_identifier(vin)
+                if new_id is not None:
+                    identifier = new_id
+                    continue
+            break
+        return listing, identifier
+
     def _update_vehicle(self, vin: str) -> "Optional[datetime]":
         """Fetch and map the newest dataset for ``vin``; return its createdOn."""
         identifier = self._identifiers.get(vin)
         if identifier is None:
-            meta = self.client.get_metadata(vin)
-            identifier = meta.get('Identifier')
-            if not identifier:
+            identifier = self._refresh_identifier(vin)
+            if identifier is None:
                 LOG.warning('No data-request identifier for vehicle %s; skipping', vin)
                 return None
-            self._identifiers[vin] = identifier
 
-        listing = self.client.list_datasets(vin, identifier)
+        listing, identifier = self._list_datasets_with_refresh(vin, identifier)
         content = sorted(
             (e for e in listing if e.get('name') and not e['name'].endswith(NO_CONTENT_SUFFIX)),
             key=lambda e: _created_on(e) or datetime.min.replace(tzinfo=timezone.utc),
@@ -418,6 +502,28 @@ class Connector(BaseConnector):
         if isinstance(charge_state, str):
             vehicle.charging.state._set_value(  # pylint: disable=protected-access
                 CHARGE_STATE_MAPPING.get(charge_state, Charging.ChargingState.UNKNOWN), measured=captured_at)
+
+        # Charge type (what the car is plugged into: AC / DC / off)
+        charge_type = dataset.value_of('charging_state_report.charge_type')
+        if isinstance(charge_type, str):
+            vehicle.charging.type._set_value(  # pylint: disable=protected-access
+                CHARGE_TYPE_MAPPING.get(charge_type, Charging.ChargingType.UNKNOWN), measured=captured_at)
+
+        # Charge rate (range gained over time). The unit comes from the companion
+        # charge_rate_unit enum (km/mi, per-h/min); normalise to a per-hour speed.
+        charge_rate = dataset.value_of('battery_state_report.charge_rate')
+        if charge_rate is not None:
+            rate_value, rate_unit = _charge_rate_per_hour(
+                charge_rate, dataset.value_of('battery_state_report.charge_rate_unit'))
+            vehicle.charging.rate._set_value(value=rate_value, measured=captured_at, unit=rate_unit)  # pylint: disable=protected-access
+
+        # Remaining time to a full charge -> estimated completion timestamp
+        # (the native attribute is a date, so add the remaining seconds to the
+        # capture time rather than exposing a raw duration).
+        remaining = dataset.value_of('battery_state_report.remaining_charging_time_complete')
+        if remaining is not None and captured_at is not None:
+            vehicle.charging.estimated_date_reached._set_value(  # pylint: disable=protected-access
+                value=captured_at + timedelta(seconds=remaining), measured=captured_at)
 
         # Target state of charge (%) - read-only here (no commands possible).
         target_soc = dataset.value_of('settings.target_soc')

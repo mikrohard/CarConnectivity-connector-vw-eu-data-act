@@ -89,7 +89,10 @@ Add a connector of type `vw_eu_data_act` to your `carconnectivity.json`:
 | `mileage.value` | `vehicle.odometer` (km) |
 | `battery_state_report.soc` | electric `drive.level` (%) |
 | `battery_state_report.charge_power` | `vehicle.charging.power` (kW) |
+| `battery_state_report.charge_rate` *(+ `charge_rate_unit`)* | `vehicle.charging.rate` (km/h or mph) |
+| `battery_state_report.remaining_charging_time_complete` | `vehicle.charging.estimated_date_reached` |
 | `charging_state_report.current_charge_state` | `vehicle.charging.state` |
+| `charging_state_report.charge_type` | `vehicle.charging.type` (AC / DC / off) |
 | `settings.target_soc` | `vehicle.charging.settings.target_level` (%) |
 | `range` *(when present)* | electric `drive.range` (km) |
 | `min_temperature` / `max_temperature` | `battery.temperature_min` / `temperature_max` (°C) |

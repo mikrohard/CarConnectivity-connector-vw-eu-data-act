@@ -96,6 +96,30 @@ def resolve_distance_unit(enum_value, default: Optional[str] = None) -> Optional
     return default
 
 
+# Charge-rate unit enums (battery_state_report.charge_rate_unit). The portal
+# expresses the charge rate as range gained over time; the unit (km vs miles,
+# per hour vs per minute) varies by vehicle/region and is read from this
+# companion field rather than hardcoded. Each maps to ``(distance, per_minute)``
+# so callers can normalise to a per-hour rate.
+CHARGE_RATE_UNIT_BY_ENUM: Dict[str, tuple] = {
+    "CHARGE_RATE_UNIT_KM_PER_H": ("km", False),
+    "CHARGE_RATE_UNIT_KM_PER_MIN": ("km", True),
+    "CHARGE_RATE_UNIT_MILES_PER_H": ("mi", False),
+    "CHARGE_RATE_UNIT_MILES_PER_MIN": ("mi", True),
+}
+
+
+def resolve_charge_rate_unit(enum_value, default=None):
+    """Map a charge-rate-unit enum to ``(distance_unit, per_minute)``.
+
+    e.g. "CHARGE_RATE_UNIT_MILES_PER_MIN" -> ("mi", True). Returns ``default``
+    when the value is missing or unrecognised.
+    """
+    if isinstance(enum_value, str):
+        return CHARGE_RATE_UNIT_BY_ENUM.get(enum_value.strip().upper(), default)
+    return default
+
+
 # Ordered enum members (protobuf index order) for the curated enum fields this
 # connector maps, lifted from the VW EU Data Act data dictionary. The full
 # 1000-field dictionary is intentionally not shipped (see module docstring);
@@ -116,6 +140,19 @@ ENUM_MEMBERS: Dict[str, tuple] = {
     "window_heating_state": (
         "WINDOW_HEATING_STATE_OFF",                                            # 0
         "WINDOW_HEATING_STATE_ON",                                            # 1
+    ),
+    "charging_state_report.charge_type": (
+        "CHARGE_TYPE_INVALID",                                                 # 0
+        "CHARGE_TYPE_OFF",                                                     # 1
+        "CHARGE_TYPE_AC",                                                      # 2
+        "CHARGE_TYPE_DC",                                                      # 3
+    ),
+    "battery_state_report.charge_rate_unit": (
+        "CHARGE_RATE_UNIT_INVALID",                                            # 0
+        "CHARGE_RATE_UNIT_KM_PER_H",                                           # 1
+        "CHARGE_RATE_UNIT_KM_PER_MIN",                                         # 2
+        "CHARGE_RATE_UNIT_MILES_PER_H",                                        # 3
+        "CHARGE_RATE_UNIT_MILES_PER_MIN",                                      # 4
     ),
 }
 

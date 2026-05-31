@@ -17,7 +17,7 @@ from carconnectivity.window_heating import WindowHeatings
 
 import requests
 
-from carconnectivity.units import Length
+from carconnectivity.units import Length, Speed
 
 from carconnectivity_connectors.vw_eu_data_act.client import ApiError, EudaApiClient
 from carconnectivity_connectors.vw_eu_data_act.connector import Connector, _filename_timestamp
@@ -264,3 +264,111 @@ def test_network_errors_become_apierror():
         client.list_datasets("WVWZZZE1ZLP010257", "ident")
     with pytest.raises(ApiError):
         client.download_dataset("WVWZZZE1ZLP010257", "ident", "x.zip")
+
+
+def test_charge_type_rate_and_remaining_time_mapped(connector):
+    """The curated charging fields ported from the HA integration (charge type,
+    charge rate, remaining time) map onto native CarConnectivity attributes."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k0", "dataFieldName": "battery_state_report.soc", "value": "55"},
+        {"key": "kc", "dataFieldName": "car_captured_time", "value": "2026-05-29T22:59:28Z"},
+        {"key": "k1", "dataFieldName": "charging_state_report.charge_type", "value": "CHARGE_TYPE_DC"},
+        {"key": "k2", "dataFieldName": "battery_state_report.charge_rate", "value": "120"},
+        {"key": "k3", "dataFieldName": "battery_state_report.charge_rate_unit",
+         "value": "CHARGE_RATE_UNIT_KM_PER_H"},
+        {"key": "k4", "dataFieldName": "battery_state_report.remaining_charging_time_complete",
+         "value": "1800s"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    vehicle = garage.get_vehicle(VIN)
+    assert vehicle.charging.type.value == Charging.ChargingType.DC
+    assert vehicle.charging.rate.value == 120
+    assert vehicle.charging.rate.unit == Speed.KMH
+    # remaining 1800s after the 22:59:28 capture -> 23:29:28
+    assert vehicle.charging.estimated_date_reached.value.isoformat().startswith("2026-05-29T23:29:28")
+
+
+def test_charge_rate_per_minute_and_miles_normalised(connector):
+    """A per-minute / miles charge rate is converted to a per-hour mph speed."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k0", "dataFieldName": "battery_state_report.soc", "value": "55"},
+        {"key": "k1", "dataFieldName": "battery_state_report.charge_rate", "value": "2"},
+        {"key": "k2", "dataFieldName": "battery_state_report.charge_rate_unit",
+         "value": "CHARGE_RATE_UNIT_MILES_PER_MIN"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    vehicle = garage.get_vehicle(VIN)
+    assert vehicle.charging.rate.value == 120  # 2 mi/min * 60
+    assert vehicle.charging.rate.unit == Speed.MPH
+
+
+def test_charge_type_integer_index_resolves(connector):
+    """charge_type delivered as a raw protobuf index resolves to its label and
+    maps onto the charging-type enum (index 2 -> AC)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k0", "dataFieldName": "battery_state_report.soc", "value": "55"},
+        {"key": "k1", "dataFieldName": "charging_state_report.charge_type", "value": "2"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).charging.type.value == Charging.ChargingType.AC
+
+
+class _RefreshFakeClient:
+    """Fake client whose list endpoint heals once the identifier is refreshed."""
+
+    def __init__(self, good_id, behaviour):
+        self.good_id = good_id
+        self.behaviour = behaviour  # "error" or "empty" for the stale identifier
+        self.metadata_calls = 0
+        self.payload = json.load(open(SAMPLE, "r", encoding="utf-8"))
+
+    def get_metadata(self, vin):
+        self.metadata_calls += 1
+        return {"Identifier": self.good_id}
+
+    def list_datasets(self, vin, identifier):
+        if identifier == self.good_id:
+            return [{"name": "20260530104136_%s.zip" % vin,
+                     "createdOn": "2026-05-30T10:41:36Z"}]
+        if self.behaviour == "error":
+            raise ApiError("GET list -> HTTP 500")
+        return []  # stale identifier returns an empty listing
+
+    def download_dataset(self, vin, identifier, name):
+        assert identifier == self.good_id, "download must use the refreshed identifier"
+        return self.payload
+
+
+@pytest.mark.parametrize("behaviour", ["error", "empty"])
+def test_self_heals_stale_identifier(connector, behaviour):
+    """A recreated portal subscription assigns a new identifier; the stored one
+    goes stale and the listing errors or returns empty. The connector must
+    re-fetch the identifier and retry once, recovering without a reload (#13)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    connector.client = _RefreshFakeClient(good_id="new-ident", behaviour=behaviour)
+    connector._identifiers[VIN] = "stale-ident"  # pylint: disable=protected-access
+
+    created = connector._update_vehicle(VIN)  # pylint: disable=protected-access
+
+    assert created is not None
+    assert connector._identifiers[VIN] == "new-ident"  # pylint: disable=protected-access
+    assert connector.client.metadata_calls == 1
+    assert garage.get_vehicle(VIN).odometer.value == 116803
