@@ -80,12 +80,18 @@ CHARGE_STATE_MAPPING: "Dict[str, Charging.ChargingState]" = {
     'CHARGE_STATE_CHARGING_ERROR': Charging.ChargingState.ERROR,
 }
 
+# Map eGolf flat charging_state strings to CarConnectivity enums.
+FLAT_CHARGE_STATE_MAPPING: "Dict[str, Charging.ChargingState]" = {
+    'charging':     Charging.ChargingState.CHARGING,
+    'not_charging': Charging.ChargingState.OFF,
+    'complete':     Charging.ChargingState.CONSERVATION,
+}
+
 WINDOW_HEATING_MAPPING: "Dict[str, WindowHeatings.HeatingState]" = {
     'WINDOW_HEATING_STATE_OFF': WindowHeatings.HeatingState.OFF,
     'WINDOW_HEATING_STATE_ON': WindowHeatings.HeatingState.ON,
     'WINDOW_HEATING_STATE_INVALID': WindowHeatings.HeatingState.INVALID,
 }
-
 
 def _filename_timestamp(name: str) -> "Optional[datetime]":
     """Parse a YYYYMMDDhhmmss segment from a dataset filename.
@@ -330,18 +336,56 @@ class Connector(BaseConnector):
         newest = content[-1]
         payload = self.client.download_dataset(vin, identifier, newest['name'])
         dataset = Dataset.from_json(payload)
-        self._map_dataset(vin, dataset)
+        self._map_dataset(vin, dataset, payload)
         return _created_on(newest)
 
     # -- mapping -----------------------------------------------------------
 
-    def _map_dataset(self, vin: str, dataset: Dataset) -> None:
+    def _extract_flat_fields(self, payload: dict) -> dict:
+        """Return a {fieldName: value} dict if payload is the eGolf flat format, else {}.
+
+        The eGolf portal delivers a flat ``Data`` array of
+        ``{dataFieldName, value, ...}`` objects instead of the nested report
+        structure used by ID.x vehicles. This helper detects that layout and
+        converts it into a plain dict for easy lookup. Entries with a missing
+        or empty value are skipped.
+        """
+        data_list = payload.get('Data') if isinstance(payload, dict) else None
+        if not isinstance(data_list, list):
+            return {}
+        # Only treat it as flat format when field names look like eGolf style
+        # (no dots) rather than ID.x style (e.g. "battery_state_report.soc").
+        result = {}
+        for item in data_list:
+            name = item.get('dataFieldName', '')
+            value = item.get('value')
+            if name and value not in (None, ''):
+                result[name] = value
+        if not result:
+            return {}
+        # If any field name contains a dot it is ID.x nested format, not flat.
+        if any('.' in k for k in result):
+            return {}
+        return result
+
+    def _map_dataset(self, vin: str, dataset: Dataset, payload: dict) -> None:
         """Map an EU Data Act dataset onto native CarConnectivity attributes (read-only)."""
         garage: Garage = self.car_connectivity.garage
         vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)  # pyright: ignore[reportAssignmentType]
         if vehicle is None:
             return
         captured_at = dataset.captured_at
+
+        # --- eGolf / flat key-value format -----------------------------------
+        # The eGolf delivers a flat Data array (no dotted field names) instead
+        # of the nested report structure used by ID.x vehicles. Detect it here
+        # and hand off to the dedicated mapper; skip the ID.x path entirely.
+        flat_fields = self._extract_flat_fields(payload)
+        if flat_fields:
+            LOG.debug('Detected flat (eGolf) dataset format for %s', vin)
+            self._map_flat_dataset(vehicle, garage, vin, flat_fields, captured_at)
+            return
+        # ---------------------------------------------------------------------
 
         # Promote to an electric vehicle once we see EV-specific data.
         is_ev = dataset.by_field('battery_state_report.soc') is not None \
@@ -376,6 +420,79 @@ class Connector(BaseConnector):
 
         if isinstance(vehicle, VWEudaElectricVehicle):
             self._map_electric(vehicle, dataset, captured_at)
+
+    def _map_flat_dataset(self, vehicle: VWEudaVehicle, garage: Garage, vin: str,
+                          fields: dict, captured_at: "Optional[datetime]") -> None:
+        """Map the eGolf flat key-value Data array onto CarConnectivity attributes."""
+        # Promote to electric vehicle
+        if not isinstance(vehicle, VWEudaElectricVehicle):
+            LOG.debug('Promoting %s to VWEudaElectricVehicle (flat format) for %s', vehicle.__class__.__name__, vin)
+            vehicle = VWEudaElectricVehicle(garage=garage, origin=vehicle)
+            garage.replace_vehicle(vin, vehicle)
+            vehicle.type._set_value(GenericVehicle.Type.ELECTRIC)  # pylint: disable=protected-access
+
+        drive = vehicle.get_electric_drive()
+        if drive is None:
+            drive = ElectricDrive(drive_id='primary', drives=vehicle.drives,
+                                  initialization=vehicle.drives.get_initialization('primary'))
+            drive.type._set_value(GenericDrive.Type.ELECTRIC)  # pylint: disable=protected-access
+            vehicle.drives.add_drive(drive)
+
+        # State of charge (%) — priority field
+        if 'state_of_charge' in fields:
+            try:
+                drive.level._set_value(value=int(fields['state_of_charge']),  # pylint: disable=protected-access
+                                       measured=captured_at)
+                drive.level.precision = 1
+                LOG.debug('eGolf %s: state_of_charge=%s%%', vin, fields['state_of_charge'])
+            except (ValueError, TypeError) as exc:
+                LOG.warning('eGolf %s: could not parse state_of_charge %r: %s', vin, fields['state_of_charge'], exc)
+
+        # Cruising range (km)
+        if 'cruising_range_primary_engine' in fields:
+            try:
+                drive.range._set_value(value=int(fields['cruising_range_primary_engine']),  # pylint: disable=protected-access
+                                       measured=captured_at, unit=Length.KM)
+                drive.range.precision = 1
+            except (ValueError, TypeError) as exc:
+                LOG.warning('eGolf %s: could not parse cruising_range_primary_engine %r: %s',
+                            vin, fields['cruising_range_primary_engine'], exc)
+
+        # Charging state
+        if 'charging_state' in fields:
+            mapped = FLAT_CHARGE_STATE_MAPPING.get(fields['charging_state'], Charging.ChargingState.UNKNOWN)
+            vehicle.charging.state._set_value(mapped, measured=captured_at)  # pylint: disable=protected-access
+
+        # Odometer (km)
+        if 'mileage' in fields:
+            try:
+                vehicle.odometer._set_value(value=int(fields['mileage']),  # pylint: disable=protected-access
+                                            measured=captured_at, unit=Length.KM)
+                vehicle.odometer.precision = 1
+            except (ValueError, TypeError) as exc:
+                LOG.warning('eGolf %s: could not parse mileage %r: %s', vin, fields['mileage'], exc)
+
+        # Lock state
+        if 'lock_state' in fields:
+            lock_map = {
+                'locked':   Doors.LockState.LOCKED,
+                'unlocked': Doors.LockState.UNLOCKED,
+            }
+            vehicle.doors.lock_state._set_value(  # pylint: disable=protected-access
+                lock_map.get(fields['lock_state'], Doors.LockState.UNKNOWN), measured=captured_at)
+
+        # Outside temperature — portal delivers tenths of Kelvin (e.g. 2956 = 22.45 °C)
+        if 'outside_temperature' in fields:
+            try:
+                kelvin_tenth = int(fields['outside_temperature'])
+                celsius = round((kelvin_tenth / 10.0) - 273.15, 1)
+                vehicle.outside_temperature._set_value(  # pylint: disable=protected-access
+                    value=celsius, measured=captured_at, unit=Temperature.C)
+            except (ValueError, TypeError) as exc:
+                LOG.warning('eGolf %s: could not parse outside_temperature %r: %s',
+                            vin, fields['outside_temperature'], exc)
+
+
 
     def _map_electric(self, vehicle: VWEudaElectricVehicle, dataset: Dataset,
                       captured_at: "Optional[datetime]") -> None:
