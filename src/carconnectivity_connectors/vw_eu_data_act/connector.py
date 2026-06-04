@@ -451,7 +451,10 @@ class Connector(BaseConnector):
             key=lambda pair: pair[1] or datetime.min.replace(tzinfo=timezone.utc),
         )
 
-                newest_created = dated[-1][1]
+        if not dated:
+            return None
+
+        newest_created = dated[-1][1]
 
         # Download and map the newest data-bearing dataset. A "no content" zip
         # for the latest interval means there is simply no data this interval
