@@ -27,6 +27,27 @@ from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehi
 SAMPLE = os.path.join(os.path.dirname(__file__), "sample_dataset.json")
 VIN = "WVWZZZE1ZLP010257"
 
+# A minimal eGolf flat-format payload (no dotted field names).
+EGOLF_VIN = "WVWZZZE1ZLP000001"
+EGOLF_PAYLOAD = {
+    "vin": EGOLF_VIN,
+    "user_id": "173ba297-16cd-4da6-bdd7-de433cd4fdf2",
+    "Data": [
+        {"key": "ae0294b4-1286-3e98-a818-1485b8d88430", "dataFieldName": "state_of_charge",
+         "value": "26", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        {"key": "55e0d40b-38ed-3cb5-9dcd-6193df6fc493", "dataFieldName": "cruising_range_primary_engine",
+         "value": "67", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        {"key": "9da735bb-c5d5-39f8-bf53-0fa2a367aa8f", "dataFieldName": "charging_state",
+         "value": "charging", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        {"key": "41c0805c-43e5-313e-9dfb-356cb8d20f7c", "dataFieldName": "mileage",
+         "value": "100571", "timestampUtc": "2026-05-31T14:11:15.000Z"},
+        {"key": "60bc0937-f5a7-3809-9535-9a7942e5dd94", "dataFieldName": "lock_state",
+         "value": "locked", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        {"key": "6810b781-e54a-35e8-af98-fcdefb54bac6", "dataFieldName": "outside_temperature",
+         "value": "2956", "timestampUtc": "2026-05-31T14:11:15.000Z"},
+    ]
+}
+
 
 def _load() -> Dataset:
     with open(SAMPLE, "r", encoding="utf-8") as fh:
@@ -264,3 +285,146 @@ def test_network_errors_become_apierror():
         client.list_datasets("WVWZZZE1ZLP010257", "ident")
     with pytest.raises(ApiError):
         client.download_dataset("WVWZZZE1ZLP010257", "ident", "x.zip")
+
+
+# ---------------------------------------------------------------------------
+# eGolf / flat-format tests
+# ---------------------------------------------------------------------------
+
+def test_extract_flat_fields_detects_egolf_format(connector):
+    """A payload with a Data array and no dotted field names is identified as
+    flat (eGolf) format and returns a populated dict."""
+    fields = connector._extract_flat_fields(EGOLF_PAYLOAD)  # pylint: disable=protected-access
+    assert fields == {
+        "state_of_charge": "26",
+        "cruising_range_primary_engine": "67",
+        "charging_state": "charging",
+        "mileage": "100571",
+        "lock_state": "locked",
+        "outside_temperature": "2956",
+    }
+
+
+def test_extract_flat_fields_rejects_idx_format(connector):
+    """A payload with dotted field names (ID.x nested format) must return {}
+    so the flat path is never triggered for ID.x vehicles."""
+    idxpayload = {"vin": VIN, "Data": [
+        {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "69"},
+        {"key": "k2", "dataFieldName": "charging_state_report.current_charge_state",
+         "value": "CHARGE_STATE_NOT_READY_FOR_CHARGING"},
+    ]}
+    assert connector._extract_flat_fields(idxpayload) == {}  # pylint: disable=protected-access
+
+
+def test_extract_flat_fields_rejects_none(connector):
+    """None and non-dict inputs must return {} without raising."""
+    assert connector._extract_flat_fields(None) == {}   # pylint: disable=protected-access
+    assert connector._extract_flat_fields({}) == {}     # pylint: disable=protected-access
+
+
+def test_egolf_ev_promotion(connector):
+    """A plain VWEudaVehicle must be promoted to VWEudaElectricVehicle when
+    the flat mapper runs, just as the ID.x path promotes on seeing EV fields."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=EGOLF_VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(EGOLF_VIN, vehicle)
+
+    connector._map_dataset(EGOLF_VIN, Dataset.from_json(EGOLF_PAYLOAD),  # pylint: disable=protected-access
+                           payload=EGOLF_PAYLOAD)
+
+    assert isinstance(garage.get_vehicle(EGOLF_VIN), VWEudaElectricVehicle)
+
+
+def test_egolf_state_of_charge(connector):
+    """state_of_charge maps onto drive.level (%)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=EGOLF_VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(EGOLF_VIN, vehicle)
+
+    connector._map_dataset(EGOLF_VIN, Dataset.from_json(EGOLF_PAYLOAD),  # pylint: disable=protected-access
+                           payload=EGOLF_PAYLOAD)
+
+    drive = garage.get_vehicle(EGOLF_VIN).get_electric_drive()
+    assert drive is not None
+    assert drive.level.value == 26
+
+
+def test_egolf_cruising_range(connector):
+    """cruising_range_primary_engine maps onto drive.range (km)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=EGOLF_VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(EGOLF_VIN, vehicle)
+
+    connector._map_dataset(EGOLF_VIN, Dataset.from_json(EGOLF_PAYLOAD),  # pylint: disable=protected-access
+                           payload=EGOLF_PAYLOAD)
+
+    drive = garage.get_vehicle(EGOLF_VIN).get_electric_drive()
+    assert drive.range.value == 67
+
+
+def test_egolf_charging_state_mapping(connector):
+    """charging_state values map correctly via FLAT_CHARGE_STATE_MAPPING."""
+    garage = connector.car_connectivity.garage
+
+    for flat_value, expected in [
+        ("charging",     Charging.ChargingState.CHARGING),
+        ("not_charging", Charging.ChargingState.OFF),
+        ("complete",     Charging.ChargingState.CONSERVATION),
+        ("unknown_val",  Charging.ChargingState.UNKNOWN),
+    ]:
+        vin = EGOLF_VIN + flat_value  # unique VIN per iteration
+        vehicle = VWEudaVehicle(vin=vin, garage=garage, managing_connector=connector)
+        garage.add_vehicle(vin, vehicle)
+        payload = {"vin": vin, "Data": [
+            {"key": "k1", "dataFieldName": "state_of_charge", "value": "50"},
+            {"key": "k2", "dataFieldName": "charging_state", "value": flat_value},
+        ]}
+        connector._map_dataset(vin, Dataset.from_json(payload),  # pylint: disable=protected-access
+                               payload=payload)
+        assert garage.get_vehicle(vin).charging.state.value == expected, \
+            f"charging_state '{flat_value}' should map to {expected}"
+
+
+def test_egolf_mileage(connector):
+    """mileage maps onto vehicle.odometer in km."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=EGOLF_VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(EGOLF_VIN, vehicle)
+
+    connector._map_dataset(EGOLF_VIN, Dataset.from_json(EGOLF_PAYLOAD),  # pylint: disable=protected-access
+                           payload=EGOLF_PAYLOAD)
+
+    v = garage.get_vehicle(EGOLF_VIN)
+    assert v.odometer.value == 100571
+    assert v.odometer.unit == Length.KM
+
+
+def test_egolf_lock_state(connector):
+    """lock_state 'locked' maps to Doors.LockState.LOCKED."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=EGOLF_VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(EGOLF_VIN, vehicle)
+
+    connector._map_dataset(EGOLF_VIN, Dataset.from_json(EGOLF_PAYLOAD),  # pylint: disable=protected-access
+                           payload=EGOLF_PAYLOAD)
+
+    assert garage.get_vehicle(EGOLF_VIN).doors.lock_state.value == Doors.LockState.LOCKED
+
+
+def test_egolf_idxpayload_not_hijacked(connector):
+    """An ID.x payload must never be routed through the flat mapper — the
+    detection heuristic (dotted field names -> ID.x) must hold firm."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    idxpayload = json.load(open(SAMPLE, "r", encoding="utf-8"))
+    connector._map_dataset(VIN, Dataset.from_json(idxpayload),  # pylint: disable=protected-access
+                           payload=idxpayload)
+
+    v = garage.get_vehicle(VIN)
+    # Must have been mapped via the ID.x path, not the flat path
+    assert isinstance(v, VWEudaElectricVehicle)
+    assert v.odometer.value == 116803
+    drive = v.get_electric_drive()
+    assert drive.level.value == 69  # from battery_state_report.soc, not state_of_charge
