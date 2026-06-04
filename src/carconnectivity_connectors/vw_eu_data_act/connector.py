@@ -140,6 +140,24 @@ def _created_on(entry: dict) -> "Optional[datetime]":
     return parsed if parsed is not None else _filename_timestamp(entry.get("name", ""))
 
 
+# --- Known mapped fields for detecting unmapped sensors --------------------
+KNOWN_MAPPED_FIELDS: set[str] = {
+    'mileage.value',
+    'mileage.unit',
+    'mileage.state',
+    'locked',
+    'window_heating_state',
+    'battery_state_report.soc',
+    'range',
+    'min_temperature',
+    'max_temperature',
+    'battery_state_report.charge_power',
+    'charging_state_report.current_charge_state',
+    'settings.target_soc',
+    'car_captured_time',
+}
+
+
 class Connector(BaseConnector):
     """Read-only connector for the Volkswagen EU Data Act portal."""
 
@@ -161,6 +179,12 @@ class Connector(BaseConnector):
         # mapped, so intervals that produced only a "no content" zip don't trigger
         # a redundant re-download of the same dataset.
         self._last_dataset: Dict[str, str] = {}
+        # Tracks whether the initial bootstrap (download all zips, build cache) has run per VIN.
+        self._bootstrapped: set[str] = set()
+        # Merged dataset per VIN tracking the latest value per field across all downloaded zips.
+        self._merged_datasets: Dict[str, Dataset] = {}
+        # Set of field names already observed per VIN (used to detect new/unmapped sensors).
+        self._observed_fields: Dict[str, set] = {}
 
         self.connection_state: EnumAttribute[ConnectionState] = EnumAttribute(
             name="connection_state", parent=self, value_type=ConnectionState,
@@ -399,7 +423,12 @@ class Connector(BaseConnector):
         return listing, identifier
 
     def _update_vehicle(self, vin: str) -> "Optional[datetime]":
-        """Fetch and map the newest dataset for ``vin``.
+        """Fetch and map the newest dataset for ``vin``; return its createdOn.
+
+        On the first call per VIN (bootstrap), downloads ALL available ZIP files
+        chronologically, merges their values field-by-field (latest wins), and maps
+        the merged dataset onto CarConnectivity attributes. Detects field names
+        that are not yet mapped and logs them as new/unmapped sensors.
 
         Returns the createdOn of the newest *listing entry* (content or "no
         content"), which marks the delivery cadence and drives the reschedule:
@@ -421,10 +450,8 @@ class Connector(BaseConnector):
             ((e, _created_on(e)) for e in listing if e.get('name')),
             key=lambda pair: pair[1] or datetime.min.replace(tzinfo=timezone.utc),
         )
-        if not dated:
-            LOG.debug('No datasets available yet for %s', vin)
-            return None
-        newest_created = dated[-1][1]
+
+                newest_created = dated[-1][1]
 
         # Download and map the newest data-bearing dataset. A "no content" zip
         # for the latest interval means there is simply no data this interval
@@ -432,15 +459,56 @@ class Connector(BaseConnector):
         # and still reschedule ~15 min out from newest_created below. Skip the
         # download when that dataset is the one we already mapped last time.
         content = [e for e, _ in dated if not e['name'].endswith(NO_CONTENT_SUFFIX)]
-        if content:
-            newest = content[-1]
-            if self._last_dataset.get(vin) != newest['name']:
-                payload = self.client.download_dataset(vin, identifier, newest['name'])
-                self._map_dataset(vin, Dataset.from_json(payload))
-                self._last_dataset[vin] = newest['name']
-        else:
+        if not content:
             LOG.debug('Latest dataset for %s carries no content; waiting for the next interval', vin)
+            return newest_created
+
+        if vin not in self._bootstrapped:
+            self._bootstrap_vehicle(vin, identifier, content)
+
+        newest = content[-1]
+        if self._last_dataset.get(vin) != newest['name']:
+            payload = self.client.download_dataset(vin, identifier, newest['name'])
+            dataset = Dataset.from_json(payload)
+            self._map_dataset(vin, dataset)
+            self._last_dataset[vin] = newest['name']
         return newest_created
+
+    def _bootstrap_vehicle(self, vin: str, identifier: str, listing: list) -> None:
+        """Download all available ZIP datasets for ``vin``, merge chronologically,
+        map the merged result, and mark the vehicle as bootstrapped."""
+        LOG.info('Bootstrapping vehicle %s: downloading %d datasets', vin, len(listing))
+        datasets: list = []
+        for entry in listing:
+            name = entry['name']
+            try:
+                payload = self.client.download_dataset(vin, identifier, name)
+                datasets.append(Dataset.from_json(payload))
+                LOG.debug('Bootstrap %s: downloaded %s', vin, name)
+            except ApiError as err:
+                LOG.warning('Bootstrap %s: failed to download %s: %s', vin, name, err)
+        if not datasets:
+            LOG.warning('Bootstrap %s: no datasets could be downloaded', vin)
+            self._bootstrapped.add(vin)
+            return
+
+        merged = Dataset.merge(datasets)
+        self._merged_datasets[vin] = merged
+        self._observed_fields[vin] = set(merged.field_names)
+        self._detect_unmapped_fields(vin, merged)
+        self._map_dataset(vin, merged)
+        self._bootstrapped.add(vin)
+        LOG.info('Bootstrapped vehicle %s: merged %d datasets, %d unique fields',
+                 vin, len(datasets), len(merged.field_names))
+
+    @staticmethod
+    def _detect_unmapped_fields(vin: str, dataset: Dataset) -> None:
+        """Log any field names in the dataset that are not yet mapped to CarConnectivity."""
+        unmapped = dataset.field_names - KNOWN_MAPPED_FIELDS
+        for field in sorted(unmapped):
+            dp = dataset.by_field(field)
+            raw = dp.raw_value if dp else '?'
+            LOG.info('New unmapped sensor for %s: field=%s value=%s', vin, field, raw)
 
     # -- mapping -----------------------------------------------------------
 

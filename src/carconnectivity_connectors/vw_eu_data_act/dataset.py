@@ -246,6 +246,26 @@ class Dataset:
             captured_at=max(captured) if captured else None,
         )
 
+    @classmethod
+    def merge(cls, datasets: list) -> "Dataset":
+        if not datasets:
+            raise ValueError("Cannot merge empty list of datasets")
+        merged_vin = datasets[-1].vin
+        merged_user = datasets[-1].user_id
+        merged_captured = None
+        latest: dict = {}
+        for ds in datasets:
+            for field_name in ds.field_names:
+                dp = ds.by_field(field_name)
+                if dp is not None:
+                    latest[field_name] = dp
+            if ds.captured_at and (merged_captured is None or ds.captured_at > merged_captured):
+                merged_captured = ds.captured_at
+        merged_pkeys = {}
+        for dp in latest.values():
+            merged_pkeys[dp.key] = dp
+        return cls(vin=merged_vin, user_id=merged_user, points=merged_pkeys, captured_at=merged_captured)
+
     def by_field(self, field_name: str) -> Optional[DataPoint]:
         """Return a single data point for a (possibly duplicated) field name.
 
@@ -264,3 +284,7 @@ class Dataset:
         """Return the typed value of ``field_name`` or ``None`` if absent."""
         dp = self.by_field(field_name)
         return dp.value if dp is not None else None
+
+    @property
+    def field_names(self) -> set:
+        return {dp.field_name for dp in self.points.values()}
