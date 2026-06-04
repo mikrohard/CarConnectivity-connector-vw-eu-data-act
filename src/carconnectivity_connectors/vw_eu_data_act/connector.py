@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
-from carconnectivity.units import Length, Power, Temperature
+from carconnectivity.units import Length, Power, Speed, Temperature
 from carconnectivity.attributes import DurationAttribute, EnumAttribute
 from carconnectivity.vehicle import GenericVehicle
 from carconnectivity.drive import ElectricDrive, GenericDrive
@@ -40,11 +40,13 @@ from carconnectivity_connectors.vw_eu_data_act.client import (
     DEFAULT_BRAND, DEFAULT_COUNTRY, DEFAULT_LANGUAGE, NO_CONTENT_SUFFIX,
     ApiError, AuthError, EudaApiClient,
 )
-from carconnectivity_connectors.vw_eu_data_act.dataset import Dataset, parse_timestamp, resolve_distance_unit
+from carconnectivity_connectors.vw_eu_data_act.dataset import (
+    Dataset, parse_timestamp, resolve_charge_rate_unit, resolve_distance_unit,
+)
 from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
 
 if TYPE_CHECKING:
-    from typing import Any, Dict, List, Optional
+    from typing import Any, Dict, List, Optional, Tuple
     from carconnectivity.carconnectivity import CarConnectivity
     from carconnectivity.garage import Garage
 
@@ -80,18 +82,36 @@ CHARGE_STATE_MAPPING: "Dict[str, Charging.ChargingState]" = {
     'CHARGE_STATE_CHARGING_ERROR': Charging.ChargingState.ERROR,
 }
 
-# Map eGolf flat charging_state strings to CarConnectivity enums.
-FLAT_CHARGE_STATE_MAPPING: "Dict[str, Charging.ChargingState]" = {
-    'charging':     Charging.ChargingState.CHARGING,
-    'not_charging': Charging.ChargingState.OFF,
-    'complete':     Charging.ChargingState.CONSERVATION,
-}
-
 WINDOW_HEATING_MAPPING: "Dict[str, WindowHeatings.HeatingState]" = {
     'WINDOW_HEATING_STATE_OFF': WindowHeatings.HeatingState.OFF,
     'WINDOW_HEATING_STATE_ON': WindowHeatings.HeatingState.ON,
     'WINDOW_HEATING_STATE_INVALID': WindowHeatings.HeatingState.INVALID,
 }
+
+# Map the portal's charge-type enum (what the car is plugged into) to the
+# generic CarConnectivity charging-type enum.
+CHARGE_TYPE_MAPPING: "Dict[str, Charging.ChargingType]" = {
+    'CHARGE_TYPE_INVALID': Charging.ChargingType.INVALID,
+    'CHARGE_TYPE_OFF': Charging.ChargingType.OFF,
+    'CHARGE_TYPE_AC': Charging.ChargingType.AC,
+    'CHARGE_TYPE_DC': Charging.ChargingType.DC,
+}
+
+
+def _charge_rate_per_hour(value: float, unit_enum) -> "Tuple[float, Speed]":
+    """Normalise a portal charge rate to a per-hour speed.
+
+    The portal reports the charge rate as range gained over time; the companion
+    ``charge_rate_unit`` enum says whether that is km or miles and per hour or
+    per minute. The native SpeedAttribute is per-hour only, so per-minute rates
+    are scaled by 60. Defaults to km/h when the unit is absent/unrecognised.
+    """
+    resolved = resolve_charge_rate_unit(unit_enum)
+    distance, per_minute = resolved if resolved is not None else ("km", False)
+    if per_minute:
+        value = value * 60
+    return value, Speed.MPH if distance == "mi" else Speed.KMH
+
 
 def _filename_timestamp(name: str) -> "Optional[datetime]":
     """Parse a YYYYMMDDhhmmss segment from a dataset filename.
@@ -120,6 +140,24 @@ def _created_on(entry: dict) -> "Optional[datetime]":
     return parsed if parsed is not None else _filename_timestamp(entry.get("name", ""))
 
 
+# --- Known mapped fields for detecting unmapped sensors --------------------
+KNOWN_MAPPED_FIELDS: set[str] = {
+    'mileage.value',
+    'mileage.unit',
+    'mileage.state',
+    'locked',
+    'window_heating_state',
+    'battery_state_report.soc',
+    'range',
+    'min_temperature',
+    'max_temperature',
+    'battery_state_report.charge_power',
+    'charging_state_report.current_charge_state',
+    'settings.target_soc',
+    'car_captured_time',
+}
+
+
 class Connector(BaseConnector):
     """Read-only connector for the Volkswagen EU Data Act portal."""
 
@@ -137,6 +175,16 @@ class Connector(BaseConnector):
         self._stop_event = threading.Event()
         # Per-VIN data-request identifier, resolved lazily from the metadata endpoint.
         self._identifiers: Dict[str, str] = {}
+        # Per-VIN name of the newest data-bearing dataset already downloaded and
+        # mapped, so intervals that produced only a "no content" zip don't trigger
+        # a redundant re-download of the same dataset.
+        self._last_dataset: Dict[str, str] = {}
+        # Tracks whether the initial bootstrap (download all zips, build cache) has run per VIN.
+        self._bootstrapped: set[str] = set()
+        # Merged dataset per VIN tracking the latest value per field across all downloaded zips.
+        self._merged_datasets: Dict[str, Dataset] = {}
+        # Set of field names already observed per VIN (used to detect new/unmapped sensors).
+        self._observed_fields: Dict[str, set] = {}
 
         self.connection_state: EnumAttribute[ConnectionState] = EnumAttribute(
             name="connection_state", parent=self, value_type=ConnectionState,
@@ -236,6 +284,13 @@ class Connector(BaseConnector):
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
                 self._stop_event.wait(900)
             except (RetrievalError, ApiError) as err:
+                # A failed poll (transient network/DNS blip, a stale data-request
+                # identifier, etc.) should recover on the next short cycle rather
+                # than freezing the data for the full ~15-min cadence: retry within
+                # ~1 min. The next successful update reschedules to the normal
+                # cadence via _reschedule(). (HA f129ebc)
+                interval = RETRY_INTERVAL.total_seconds()
+                self.interval._set_value(RETRY_INTERVAL)  # pylint: disable=protected-access
                 LOG.error('Retrieval error during update (%s). Will try again after %ss', str(err), interval)
                 self.connection_state._set_value(value=ConnectionState.ERROR)  # pylint: disable=protected-access
                 self._stop_event.wait(interval)
@@ -314,185 +369,241 @@ class Connector(BaseConnector):
         # enabled attributes are never announced and HA entities stay "unavailable".
         self.car_connectivity.transaction_end()
 
+    def _refresh_identifier(self, vin: str) -> "Optional[str]":
+        """(Re-)fetch the data-request identifier from the metadata endpoint.
+
+        Returns the identifier and updates the cache when the portal hands out a
+        *new* one (e.g. after the continuous data subscription was deleted and
+        recreated, which assigns a fresh identifier and silently invalidates the
+        stored one). Returns ``None`` when it is unavailable or unchanged.
+        """
+        try:
+            meta = self.client.get_metadata(vin)
+        except ApiError as err:
+            LOG.debug('Could not refresh data-request identifier for %s: %s', vin, err)
+            return None
+        new_id = meta.get('Identifier') or meta.get('identifier')
+        if not new_id or new_id == self._identifiers.get(vin):
+            return None
+        if vin in self._identifiers:
+            LOG.warning('Data-request identifier for %s changed (%s -> %s); the portal '
+                        'subscription was likely recreated. Using the new identifier.',
+                        vin, self._identifiers[vin], new_id)
+        self._identifiers[vin] = new_id
+        return new_id
+
+    def _list_datasets_with_refresh(self, vin: str, identifier: str) -> "Tuple[List[dict], str]":
+        """List datasets, self-healing a stale identifier once if needed.
+
+        A recreated subscription makes the stored identifier stale: the listing
+        then errors or comes back empty. On either signal, re-fetch the
+        identifier and retry once before giving up, so the connector recovers
+        automatically on the next cycle without a manual reload. The metadata
+        call only happens on that failure/empty signal, so there is no extra API
+        load in normal operation. (HA 2c979c7, issue #13)
+        """
+        listing: "List[dict]" = []
+        for retried in (False, True):
+            try:
+                listing = self.client.list_datasets(vin, identifier)
+            except ApiError:
+                if not retried:
+                    new_id = self._refresh_identifier(vin)
+                    if new_id is not None:
+                        identifier = new_id
+                        continue
+                raise
+            # An empty listing can also mean the subscription was recreated.
+            if not listing and not retried:
+                new_id = self._refresh_identifier(vin)
+                if new_id is not None:
+                    identifier = new_id
+                    continue
+            break
+        return listing, identifier
+
     def _update_vehicle(self, vin: str) -> "Optional[datetime]":
-        """Fetch and map the newest dataset for ``vin``; return its createdOn."""
+        """Fetch and map the newest dataset for ``vin``; return its createdOn.
+
+        On the first call per VIN (bootstrap), downloads ALL available ZIP files
+        chronologically, merges their values field-by-field (latest wins), and maps
+        the merged dataset onto CarConnectivity attributes. Detects field names
+        that are not yet mapped and logs them as new/unmapped sensors.
+
+        Returns the createdOn of the newest *listing entry* (content or "no
+        content"), which marks the delivery cadence and drives the reschedule:
+        the portal emits one zip per ~15-min interval, so the next one is due
+        ~15 min after the newest one regardless of whether it carried data.
+        Returns ``None`` only when there is nothing dated to schedule from
+        (empty/unprovisioned listing), in which case the caller retries soon.
+        """
         identifier = self._identifiers.get(vin)
         if identifier is None:
-            meta = self.client.get_metadata(vin)
-            identifier = meta.get('Identifier')
-            if not identifier:
+            identifier = self._refresh_identifier(vin)
+            if identifier is None:
                 LOG.warning('No data-request identifier for vehicle %s; skipping', vin)
                 return None
-            self._identifiers[vin] = identifier
 
-        listing = self.client.list_datasets(vin, identifier)
-        content = sorted(
-            (e for e in listing if e.get('name') and not e['name'].endswith(NO_CONTENT_SUFFIX)),
-            key=lambda e: _created_on(e) or datetime.min.replace(tzinfo=timezone.utc),
+        listing, identifier = self._list_datasets_with_refresh(vin, identifier)
+        # All named entries, oldest -> newest by createdOn (or filename fallback).
+        dated = sorted(
+            ((e, _created_on(e)) for e in listing if e.get('name')),
+            key=lambda pair: pair[1] or datetime.min.replace(tzinfo=timezone.utc),
         )
-        if not content:
-            LOG.debug('No content datasets available yet for %s', vin)
+
+        if not dated:
             return None
+
+        newest_created = dated[-1][1]
+
+        # Download and map the newest data-bearing dataset. A "no content" zip
+        # for the latest interval means there is simply no data this interval
+        # (not an error or an overdue dataset), so we keep the last known values
+        # and still reschedule ~15 min out from newest_created below. Skip the
+        # download when that dataset is the one we already mapped last time.
+        content = [e for e, _ in dated if not e['name'].endswith(NO_CONTENT_SUFFIX)]
+        if not content:
+            LOG.debug('Latest dataset for %s carries no content; waiting for the next interval', vin)
+            return newest_created
+
+        if vin not in self._bootstrapped:
+            self._bootstrap_vehicle(vin, identifier, content)
+            if vin in self._merged_datasets:
+                self._last_dataset[vin] = content[-1]['name']
+
         newest = content[-1]
-        payload = self.client.download_dataset(vin, identifier, newest['name'])
-        dataset = Dataset.from_json(payload)
-        self._map_dataset(vin, dataset, payload)
-        return _created_on(newest)
+        if self._last_dataset.get(vin) != newest['name']:
+            payload = self.client.download_dataset(vin, identifier, newest['name'])
+            dataset = Dataset.from_json(payload)
+            self._map_dataset(vin, dataset)
+            self._last_dataset[vin] = newest['name']
+        return newest_created
+
+    def _bootstrap_vehicle(self, vin: str, identifier: str, listing: list) -> None:
+        """Download all available ZIP datasets for ``vin``, merge chronologically,
+        map the merged result, and mark the vehicle as bootstrapped."""
+        LOG.info('Bootstrapping vehicle %s: downloading %d datasets', vin, len(listing))
+        datasets: list = []
+        for entry in listing:
+            name = entry['name']
+            try:
+                payload = self.client.download_dataset(vin, identifier, name)
+                datasets.append(Dataset.from_json(payload))
+                LOG.debug('Bootstrap %s: downloaded %s', vin, name)
+            except ApiError as err:
+                LOG.warning('Bootstrap %s: failed to download %s: %s', vin, name, err)
+        if not datasets:
+            LOG.warning('Bootstrap %s: no datasets could be downloaded', vin)
+            self._bootstrapped.add(vin)
+            return
+
+        merged = Dataset.merge(datasets)
+        self._merged_datasets[vin] = merged
+        self._observed_fields[vin] = set(merged.field_names)
+        self._detect_unmapped_fields(vin, merged)
+        self._map_dataset(vin, merged)
+        self._bootstrapped.add(vin)
+        LOG.info('Bootstrapped vehicle %s: merged %d datasets, %d unique fields',
+                 vin, len(datasets), len(merged.field_names))
+
+    @staticmethod
+    def _detect_unmapped_fields(vin: str, dataset: Dataset) -> None:
+        """Log any field names in the dataset that are not yet mapped to CarConnectivity."""
+        unmapped = dataset.field_names - KNOWN_MAPPED_FIELDS
+        for field in sorted(unmapped):
+            dp = dataset.by_field(field)
+            raw = dp.raw_value if dp else '?'
+            LOG.info('New unmapped sensor for %s: field=%s value=%s', vin, field, raw)
 
     # -- mapping -----------------------------------------------------------
 
-    def _extract_flat_fields(self, payload: dict) -> dict:
-        """Return a {fieldName: value} dict if payload is the eGolf flat format, else {}.
-
-        The eGolf portal delivers a flat ``Data`` array of
-        ``{dataFieldName, value, ...}`` objects instead of the nested report
-        structure used by ID.x vehicles. This helper detects that layout and
-        converts it into a plain dict for easy lookup. Entries with a missing
-        or empty value are skipped.
-        """
-        data_list = payload.get('Data') if isinstance(payload, dict) else None
-        if not isinstance(data_list, list):
-            return {}
-        # Only treat it as flat format when field names look like eGolf style
-        # (no dots) rather than ID.x style (e.g. "battery_state_report.soc").
-        result = {}
-        for item in data_list:
-            name = item.get('dataFieldName', '')
-            value = item.get('value')
-            if name and value not in (None, ''):
-                result[name] = value
-        if not result:
-            return {}
-        # If any field name contains a dot it is ID.x nested format, not flat.
-        if any('.' in k for k in result):
-            return {}
-        return result
-
-    def _map_dataset(self, vin: str, dataset: Dataset, payload: Optional[dict] = None) -> None:
+    def _map_dataset(self, vin: str, dataset: Dataset) -> None:
         """Map an EU Data Act dataset onto native CarConnectivity attributes (read-only)."""
         garage: Garage = self.car_connectivity.garage
-        vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)  # pyright: ignore[reportAssignmentType]
+        vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)
         if vehicle is None:
             return
+    
         captured_at = dataset.captured_at
-
-        # --- eGolf / flat key-value format -----------------------------------
-        # The eGolf delivers a flat Data array (no dotted field names) instead
-        # of the nested report structure used by ID.x vehicles. Detect it here
-        # and hand off to the dedicated mapper; skip the ID.x path entirely.
-        flat_fields = self._extract_flat_fields(payload) if payload is not None else {}
-        if flat_fields:
-            LOG.debug('Detected flat (eGolf) dataset format for %s', vin)
-            self._map_flat_dataset(vehicle, garage, vin, flat_fields, captured_at)
-            return
-        # ---------------------------------------------------------------------
-
-        # Promote to an electric vehicle once we see EV-specific data.
-        is_ev = dataset.by_field('battery_state_report.soc') is not None \
-            or dataset.by_field('battery_state_report.charge_power') is not None \
+    
+        # -------------------------
+        # EV PROMOTION DETECTION (FIXED)
+        # -------------------------
+        is_ev = (
+            dataset.by_field('battery_state_report.soc') is not None
+            or dataset.by_field('battery_state_report.charge_power') is not None
             or dataset.by_field('charging_state_report.current_charge_state') is not None
+            or dataset.by_field('state_of_charge') is not None   # <-- eGolf FIX
+            or dataset.by_field('cruising_range_primary_engine') is not None  # <-- eGolf FIX
+        )
+    
         if is_ev and not isinstance(vehicle, VWEudaElectricVehicle):
-            LOG.debug('Promoting %s to VWEudaElectricVehicle for %s', vehicle.__class__.__name__, vin)
+            LOG.debug('Promoting %s to VWEudaElectricVehicle for %s',
+                      vehicle.__class__.__name__, vin)
             vehicle = VWEudaElectricVehicle(garage=garage, origin=vehicle)
             garage.replace_vehicle(vin, vehicle)
-            vehicle.type._set_value(GenericVehicle.Type.ELECTRIC)  # pylint: disable=protected-access
-
-        # Odometer (mileage.value). The portal reports km or miles depending on
-        # the vehicle; the unit comes from the companion mileage.unit enum, with
-        # km as the fallback when that field is absent.
+            vehicle.type._set_value(GenericVehicle.Type.ELECTRIC)
+    
+        # -------------------------
+        # EXISTING MAPPING (UNCHANGED)
+        # -------------------------
         mileage = dataset.value_of('mileage.value')
         if mileage is not None:
             mileage_unit = Length.MI if resolve_distance_unit(dataset.value_of('mileage.unit')) == 'mi' else Length.KM
-            vehicle.odometer._set_value(value=mileage, measured=captured_at, unit=mileage_unit)  # pylint: disable=protected-access
+            vehicle.odometer._set_value(value=mileage, measured=captured_at, unit=mileage_unit)
             vehicle.odometer.precision = 1
-
-        # Doors lock state
+    
         locked = dataset.value_of('locked')
         if isinstance(locked, bool):
-            vehicle.doors.lock_state._set_value(  # pylint: disable=protected-access
-                Doors.LockState.LOCKED if locked else Doors.LockState.UNLOCKED, measured=captured_at)
-
-        # Window heating state
+            vehicle.doors.lock_state._set_value(
+                Doors.LockState.LOCKED if locked else Doors.LockState.UNLOCKED,
+                measured=captured_at
+            )
+    
         wh = dataset.value_of('window_heating_state')
         if isinstance(wh, str):
-            vehicle.window_heatings.heating_state._set_value(  # pylint: disable=protected-access
-                WINDOW_HEATING_MAPPING.get(wh, WindowHeatings.HeatingState.UNKNOWN), measured=captured_at)
-
+            vehicle.window_heatings.heating_state._set_value(
+                WINDOW_HEATING_MAPPING.get(wh, WindowHeatings.HeatingState.UNKNOWN),
+                measured=captured_at
+            )
+    
+        # -------------------------
+        # EV STRUCTURED MAPPING (UNCHANGED)
+        # -------------------------
         if isinstance(vehicle, VWEudaElectricVehicle):
             self._map_electric(vehicle, dataset, captured_at)
-
-    def _map_flat_dataset(self, vehicle: VWEudaVehicle, garage: Garage, vin: str,
-                          fields: dict, captured_at: "Optional[datetime]") -> None:
-        """Map the eGolf flat key-value Data array onto CarConnectivity attributes."""
-        # Promote to electric vehicle
-        if not isinstance(vehicle, VWEudaElectricVehicle):
-            LOG.debug('Promoting %s to VWEudaElectricVehicle (flat format) for %s', vehicle.__class__.__name__, vin)
-            vehicle = VWEudaElectricVehicle(garage=garage, origin=vehicle)
-            garage.replace_vehicle(vin, vehicle)
-            vehicle.type._set_value(GenericVehicle.Type.ELECTRIC)  # pylint: disable=protected-access
-
-        drive = vehicle.get_electric_drive()
-        if drive is None:
-            drive = ElectricDrive(drive_id='primary', drives=vehicle.drives,
-                                  initialization=vehicle.drives.get_initialization('primary'))
-            drive.type._set_value(GenericDrive.Type.ELECTRIC)  # pylint: disable=protected-access
-            vehicle.drives.add_drive(drive)
-
-        # State of charge (%) — priority field
-        if 'state_of_charge' in fields:
-            try:
-                drive.level._set_value(value=int(fields['state_of_charge']),  # pylint: disable=protected-access
-                                       measured=captured_at)
+    
+            drive = vehicle.get_electric_drive()
+            if drive is None:
+                drive = ElectricDrive(
+                    drive_id='primary',
+                    drives=vehicle.drives,
+                    initialization=vehicle.drives.get_initialization('primary')
+                )
+                drive.type._set_value(GenericDrive.Type.ELECTRIC)
+                vehicle.drives.add_drive(drive)
+    
+            # -------------------------
+            # FLAT FIELD EXTENSION (NEW BUT SAFE)
+            # -------------------------
+    
+            # state_of_charge (eGolf)
+            soc = dataset.value_of('state_of_charge')
+            if soc is not None:
+                drive.level._set_value(value=soc, measured=captured_at)
                 drive.level.precision = 1
-                LOG.debug('eGolf %s: state_of_charge=%s%%', vin, fields['state_of_charge'])
-            except (ValueError, TypeError) as exc:
-                LOG.warning('eGolf %s: could not parse state_of_charge %r: %s', vin, fields['state_of_charge'], exc)
-
-        # Cruising range (km)
-        if 'cruising_range_primary_engine' in fields:
-            try:
-                drive.range._set_value(value=int(fields['cruising_range_primary_engine']),  # pylint: disable=protected-access
-                                       measured=captured_at, unit=Length.KM)
+    
+            # cruising range (eGolf)
+            rng = dataset.value_of('cruising_range_primary_engine')
+            if rng is not None:
+                drive.range._set_value(value=rng, measured=captured_at, unit=Length.KM)
                 drive.range.precision = 1
-            except (ValueError, TypeError) as exc:
-                LOG.warning('eGolf %s: could not parse cruising_range_primary_engine %r: %s',
-                            vin, fields['cruising_range_primary_engine'], exc)
-
-        # Charging state
-        if 'charging_state' in fields:
-            mapped = FLAT_CHARGE_STATE_MAPPING.get(fields['charging_state'], Charging.ChargingState.UNKNOWN)
-            vehicle.charging.state._set_value(mapped, measured=captured_at)  # pylint: disable=protected-access
-
-        # Odometer (km)
-        if 'mileage' in fields:
-            try:
-                vehicle.odometer._set_value(value=int(fields['mileage']),  # pylint: disable=protected-access
-                                            measured=captured_at, unit=Length.KM)
+    
+            # flat mileage fallback (some datasets only provide this)
+            flat_mileage = dataset.value_of('mileage')
+            if flat_mileage is not None and mileage is None:
+                vehicle.odometer._set_value(value=flat_mileage, measured=captured_at, unit=Length.KM)
                 vehicle.odometer.precision = 1
-            except (ValueError, TypeError) as exc:
-                LOG.warning('eGolf %s: could not parse mileage %r: %s', vin, fields['mileage'], exc)
-
-        # Lock state
-        if 'lock_state' in fields:
-            lock_map = {
-                'locked':   Doors.LockState.LOCKED,
-                'unlocked': Doors.LockState.UNLOCKED,
-            }
-            vehicle.doors.lock_state._set_value(  # pylint: disable=protected-access
-                lock_map.get(fields['lock_state'], Doors.LockState.UNKNOWN), measured=captured_at)
-
-        # Outside temperature — portal delivers tenths of Kelvin (e.g. 2956 = 22.45 °C)
-        if 'outside_temperature' in fields:
-            try:
-                kelvin_tenth = int(fields['outside_temperature'])
-                celsius = round((kelvin_tenth / 10.0) - 273.15, 1)
-                vehicle.outside_temperature._set_value(  # pylint: disable=protected-access
-                    value=celsius, measured=captured_at, unit=Temperature.C)
-            except (ValueError, TypeError) as exc:
-                LOG.warning('eGolf %s: could not parse outside_temperature %r: %s',
-                            vin, fields['outside_temperature'], exc)
-
-
 
     def _map_electric(self, vehicle: VWEudaElectricVehicle, dataset: Dataset,
                       captured_at: "Optional[datetime]") -> None:
@@ -535,6 +646,28 @@ class Connector(BaseConnector):
         if isinstance(charge_state, str):
             vehicle.charging.state._set_value(  # pylint: disable=protected-access
                 CHARGE_STATE_MAPPING.get(charge_state, Charging.ChargingState.UNKNOWN), measured=captured_at)
+
+        # Charge type (what the car is plugged into: AC / DC / off)
+        charge_type = dataset.value_of('charging_state_report.charge_type')
+        if isinstance(charge_type, str):
+            vehicle.charging.type._set_value(  # pylint: disable=protected-access
+                CHARGE_TYPE_MAPPING.get(charge_type, Charging.ChargingType.UNKNOWN), measured=captured_at)
+
+        # Charge rate (range gained over time). The unit comes from the companion
+        # charge_rate_unit enum (km/mi, per-h/min); normalise to a per-hour speed.
+        charge_rate = dataset.value_of('battery_state_report.charge_rate')
+        if charge_rate is not None:
+            rate_value, rate_unit = _charge_rate_per_hour(
+                charge_rate, dataset.value_of('battery_state_report.charge_rate_unit'))
+            vehicle.charging.rate._set_value(value=rate_value, measured=captured_at, unit=rate_unit)  # pylint: disable=protected-access
+
+        # Remaining time to a full charge -> estimated completion timestamp
+        # (the native attribute is a date, so add the remaining seconds to the
+        # capture time rather than exposing a raw duration).
+        remaining = dataset.value_of('battery_state_report.remaining_charging_time_complete')
+        if remaining is not None and captured_at is not None:
+            vehicle.charging.estimated_date_reached._set_value(  # pylint: disable=protected-access
+                value=captured_at + timedelta(seconds=remaining), measured=captured_at)
 
         # Target state of charge (%) - read-only here (no commands possible).
         target_soc = dataset.value_of('settings.target_soc')
