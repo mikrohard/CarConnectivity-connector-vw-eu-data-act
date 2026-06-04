@@ -465,6 +465,8 @@ class Connector(BaseConnector):
 
         if vin not in self._bootstrapped:
             self._bootstrap_vehicle(vin, identifier, content)
+            if vin in self._merged_datasets:
+                self._last_dataset[vin] = content[-1]['name']
 
         newest = content[-1]
         if self._last_dataset.get(vin) != newest['name']:
