@@ -6,6 +6,7 @@ the sample dataset shipped by the EU Data Act portal.
 """
 import json
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -372,3 +373,57 @@ def test_self_heals_stale_identifier(connector, behaviour):
     assert connector._identifiers[VIN] == "new-ident"  # pylint: disable=protected-access
     assert connector.client.metadata_calls == 1
     assert garage.get_vehicle(VIN).odometer.value == 116803
+
+
+def test_no_content_latest_interval_reschedules_to_next_interval(connector):
+    """A "no content" zip for the latest interval means there is simply no data
+    this interval - not that the dataset is overdue. The next poll must be ~15
+    min after that zip, not the ~1-min retry, and the unchanged older content
+    must not be re-downloaded."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    now = datetime.now(tz=timezone.utc)
+    older_name = "20260101000000_%s.zip" % VIN
+    # Pretend the older content dataset was already mapped on a previous cycle.
+    connector._identifiers[VIN] = "ident"  # pylint: disable=protected-access
+    connector._last_dataset[VIN] = older_name  # pylint: disable=protected-access
+
+    class _FakeClient:
+        def list_datasets(self, vin, identifier):
+            return [
+                {"name": older_name, "createdOn": (now - timedelta(minutes=30)).isoformat()},
+                {"name": "%s_no_content_found.zip" % vin,
+                 "createdOn": (now - timedelta(minutes=2)).isoformat()},
+            ]
+
+        def download_dataset(self, vin, identifier, name):
+            raise AssertionError("must not re-download the unchanged content dataset")
+
+    connector.client = _FakeClient()
+    connector.update_vehicles()
+
+    # newest entry was ~2 min ago -> next due ~13 min out, well above the 1-min retry.
+    assert connector.interval.value > timedelta(minutes=10)
+
+
+def test_no_datasets_at_all_retries_soon(connector):
+    """An empty listing (e.g. still provisioning) has no cadence to schedule
+    from, so the connector falls back to the short retry interval."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+    connector._identifiers[VIN] = "ident"  # pylint: disable=protected-access
+
+    class _FakeClient:
+        def get_metadata(self, vin):
+            return {"Identifier": "ident"}  # refresh finds no new identifier
+
+        def list_datasets(self, vin, identifier):
+            return []
+
+    connector.client = _FakeClient()
+    connector.update_vehicles()
+
+    assert connector.interval.value == timedelta(minutes=1)

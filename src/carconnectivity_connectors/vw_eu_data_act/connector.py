@@ -157,6 +157,10 @@ class Connector(BaseConnector):
         self._stop_event = threading.Event()
         # Per-VIN data-request identifier, resolved lazily from the metadata endpoint.
         self._identifiers: Dict[str, str] = {}
+        # Per-VIN name of the newest data-bearing dataset already downloaded and
+        # mapped, so intervals that produced only a "no content" zip don't trigger
+        # a redundant re-download of the same dataset.
+        self._last_dataset: Dict[str, str] = {}
 
         self.connection_state: EnumAttribute[ConnectionState] = EnumAttribute(
             name="connection_state", parent=self, value_type=ConnectionState,
@@ -395,7 +399,15 @@ class Connector(BaseConnector):
         return listing, identifier
 
     def _update_vehicle(self, vin: str) -> "Optional[datetime]":
-        """Fetch and map the newest dataset for ``vin``; return its createdOn."""
+        """Fetch and map the newest dataset for ``vin``.
+
+        Returns the createdOn of the newest *listing entry* (content or "no
+        content"), which marks the delivery cadence and drives the reschedule:
+        the portal emits one zip per ~15-min interval, so the next one is due
+        ~15 min after the newest one regardless of whether it carried data.
+        Returns ``None`` only when there is nothing dated to schedule from
+        (empty/unprovisioned listing), in which case the caller retries soon.
+        """
         identifier = self._identifiers.get(vin)
         if identifier is None:
             identifier = self._refresh_identifier(vin)
@@ -404,18 +416,31 @@ class Connector(BaseConnector):
                 return None
 
         listing, identifier = self._list_datasets_with_refresh(vin, identifier)
-        content = sorted(
-            (e for e in listing if e.get('name') and not e['name'].endswith(NO_CONTENT_SUFFIX)),
-            key=lambda e: _created_on(e) or datetime.min.replace(tzinfo=timezone.utc),
+        # All named entries, oldest -> newest by createdOn (or filename fallback).
+        dated = sorted(
+            ((e, _created_on(e)) for e in listing if e.get('name')),
+            key=lambda pair: pair[1] or datetime.min.replace(tzinfo=timezone.utc),
         )
-        if not content:
-            LOG.debug('No content datasets available yet for %s', vin)
+        if not dated:
+            LOG.debug('No datasets available yet for %s', vin)
             return None
-        newest = content[-1]
-        payload = self.client.download_dataset(vin, identifier, newest['name'])
-        dataset = Dataset.from_json(payload)
-        self._map_dataset(vin, dataset)
-        return _created_on(newest)
+        newest_created = dated[-1][1]
+
+        # Download and map the newest data-bearing dataset. A "no content" zip
+        # for the latest interval means there is simply no data this interval
+        # (not an error or an overdue dataset), so we keep the last known values
+        # and still reschedule ~15 min out from newest_created below. Skip the
+        # download when that dataset is the one we already mapped last time.
+        content = [e for e, _ in dated if not e['name'].endswith(NO_CONTENT_SUFFIX)]
+        if content:
+            newest = content[-1]
+            if self._last_dataset.get(vin) != newest['name']:
+                payload = self.client.download_dataset(vin, identifier, newest['name'])
+                self._map_dataset(vin, Dataset.from_json(payload))
+                self._last_dataset[vin] = newest['name']
+        else:
+            LOG.debug('Latest dataset for %s carries no content; waiting for the next interval', vin)
+        return newest_created
 
     # -- mapping -----------------------------------------------------------
 
