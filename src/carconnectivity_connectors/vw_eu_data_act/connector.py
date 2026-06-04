@@ -368,7 +368,7 @@ class Connector(BaseConnector):
             return {}
         return result
 
-    def _map_dataset(self, vin: str, dataset: Dataset, payload: dict) -> None:
+    def _map_dataset(self, vin: str, dataset: Dataset, payload: Optional[dict] = None) -> None:
         """Map an EU Data Act dataset onto native CarConnectivity attributes (read-only)."""
         garage: Garage = self.car_connectivity.garage
         vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)  # pyright: ignore[reportAssignmentType]
@@ -380,7 +380,7 @@ class Connector(BaseConnector):
         # The eGolf delivers a flat Data array (no dotted field names) instead
         # of the nested report structure used by ID.x vehicles. Detect it here
         # and hand off to the dedicated mapper; skip the ID.x path entirely.
-        flat_fields = self._extract_flat_fields(payload)
+        flat_fields = self._extract_flat_fields(payload) if payload is not None else {}
         if flat_fields:
             LOG.debug('Detected flat (eGolf) dataset format for %s', vin)
             self._map_flat_dataset(vehicle, garage, vin, flat_fields, captured_at)
