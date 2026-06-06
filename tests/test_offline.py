@@ -604,6 +604,24 @@ def test_known_mapped_fields_contains_mapped_fields():
     assert "max_temperature" in KNOWN_MAPPED_FIELDS
     assert "battery_state_report.charge_power" in KNOWN_MAPPED_FIELDS
     assert "range" in KNOWN_MAPPED_FIELDS
+    # Curated charging fields and flat-format (eGolf) fields are mapped too, so
+    # they must not be reported as "new unmapped sensor".
+    assert "charging_state_report.charge_type" in KNOWN_MAPPED_FIELDS
+    assert "battery_state_report.charge_rate" in KNOWN_MAPPED_FIELDS
+    assert "battery_state_report.charge_rate_unit" in KNOWN_MAPPED_FIELDS
+    assert "battery_state_report.remaining_charging_time_complete" in KNOWN_MAPPED_FIELDS
+    assert "state_of_charge" in KNOWN_MAPPED_FIELDS
+    assert "cruising_range_primary_engine" in KNOWN_MAPPED_FIELDS
+    assert "mileage" in KNOWN_MAPPED_FIELDS
+
+
+def test_egolf_flat_fields_not_flagged_unmapped(caplog):
+    """The eGolf flat-format payload's mapped fields must not trigger the
+    'new unmapped sensor' notice."""
+    with caplog.at_level(logging.INFO, logger="carconnectivity.connectors.vw_eu_data_act"):
+        Connector._detect_unmapped_fields(EGOLF_VIN, Dataset.from_json(EGOLF_PAYLOAD))  # pylint: disable=protected-access
+    assert "state_of_charge" not in caplog.text
+    assert "cruising_range_primary_engine" not in caplog.text
 
 
 def test_unmapped_field_detection(caplog):

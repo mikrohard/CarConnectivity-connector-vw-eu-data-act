@@ -152,9 +152,17 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'min_temperature',
     'max_temperature',
     'battery_state_report.charge_power',
+    'battery_state_report.charge_rate',
+    'battery_state_report.charge_rate_unit',
+    'battery_state_report.remaining_charging_time_complete',
     'charging_state_report.current_charge_state',
+    'charging_state_report.charge_type',
     'settings.target_soc',
     'car_captured_time',
+    # Flat-format (eGolf) fields handled in _map_dataset.
+    'mileage',
+    'state_of_charge',
+    'cruising_range_primary_engine',
 }
 
 
