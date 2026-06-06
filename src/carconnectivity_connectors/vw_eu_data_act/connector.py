@@ -520,44 +520,90 @@ class Connector(BaseConnector):
     def _map_dataset(self, vin: str, dataset: Dataset) -> None:
         """Map an EU Data Act dataset onto native CarConnectivity attributes (read-only)."""
         garage: Garage = self.car_connectivity.garage
-        vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)  # pyright: ignore[reportAssignmentType]
+        vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)
         if vehicle is None:
             return
+    
         captured_at = dataset.captured_at
-
-        # Promote to an electric vehicle once we see EV-specific data.
-        is_ev = dataset.by_field('battery_state_report.soc') is not None \
-            or dataset.by_field('battery_state_report.charge_power') is not None \
+    
+        # -------------------------
+        # EV PROMOTION DETECTION (FIXED)
+        # -------------------------
+        is_ev = (
+            dataset.by_field('battery_state_report.soc') is not None
+            or dataset.by_field('battery_state_report.charge_power') is not None
             or dataset.by_field('charging_state_report.current_charge_state') is not None
+            or dataset.by_field('state_of_charge') is not None   # <-- eGolf FIX
+            or dataset.by_field('cruising_range_primary_engine') is not None  # <-- eGolf FIX
+        )
+    
         if is_ev and not isinstance(vehicle, VWEudaElectricVehicle):
-            LOG.debug('Promoting %s to VWEudaElectricVehicle for %s', vehicle.__class__.__name__, vin)
+            LOG.debug('Promoting %s to VWEudaElectricVehicle for %s',
+                      vehicle.__class__.__name__, vin)
             vehicle = VWEudaElectricVehicle(garage=garage, origin=vehicle)
             garage.replace_vehicle(vin, vehicle)
-            vehicle.type._set_value(GenericVehicle.Type.ELECTRIC)  # pylint: disable=protected-access
-
-        # Odometer (mileage.value). The portal reports km or miles depending on
-        # the vehicle; the unit comes from the companion mileage.unit enum, with
-        # km as the fallback when that field is absent.
+            vehicle.type._set_value(GenericVehicle.Type.ELECTRIC)
+    
+        # -------------------------
+        # EXISTING MAPPING (UNCHANGED)
+        # -------------------------
         mileage = dataset.value_of('mileage.value')
         if mileage is not None:
             mileage_unit = Length.MI if resolve_distance_unit(dataset.value_of('mileage.unit')) == 'mi' else Length.KM
-            vehicle.odometer._set_value(value=mileage, measured=captured_at, unit=mileage_unit)  # pylint: disable=protected-access
+            vehicle.odometer._set_value(value=mileage, measured=captured_at, unit=mileage_unit)
             vehicle.odometer.precision = 1
-
-        # Doors lock state
+    
         locked = dataset.value_of('locked')
         if isinstance(locked, bool):
-            vehicle.doors.lock_state._set_value(  # pylint: disable=protected-access
-                Doors.LockState.LOCKED if locked else Doors.LockState.UNLOCKED, measured=captured_at)
-
-        # Window heating state
+            vehicle.doors.lock_state._set_value(
+                Doors.LockState.LOCKED if locked else Doors.LockState.UNLOCKED,
+                measured=captured_at
+            )
+    
         wh = dataset.value_of('window_heating_state')
         if isinstance(wh, str):
-            vehicle.window_heatings.heating_state._set_value(  # pylint: disable=protected-access
-                WINDOW_HEATING_MAPPING.get(wh, WindowHeatings.HeatingState.UNKNOWN), measured=captured_at)
-
+            vehicle.window_heatings.heating_state._set_value(
+                WINDOW_HEATING_MAPPING.get(wh, WindowHeatings.HeatingState.UNKNOWN),
+                measured=captured_at
+            )
+    
+        # -------------------------
+        # EV STRUCTURED MAPPING (UNCHANGED)
+        # -------------------------
         if isinstance(vehicle, VWEudaElectricVehicle):
             self._map_electric(vehicle, dataset, captured_at)
+    
+            drive = vehicle.get_electric_drive()
+            if drive is None:
+                drive = ElectricDrive(
+                    drive_id='primary',
+                    drives=vehicle.drives,
+                    initialization=vehicle.drives.get_initialization('primary')
+                )
+                drive.type._set_value(GenericDrive.Type.ELECTRIC)
+                vehicle.drives.add_drive(drive)
+    
+            # -------------------------
+            # FLAT FIELD EXTENSION (NEW BUT SAFE)
+            # -------------------------
+    
+            # state_of_charge (eGolf)
+            soc = dataset.value_of('state_of_charge')
+            if soc is not None:
+                drive.level._set_value(value=soc, measured=captured_at)
+                drive.level.precision = 1
+    
+            # cruising range (eGolf)
+            rng = dataset.value_of('cruising_range_primary_engine')
+            if rng is not None:
+                drive.range._set_value(value=rng, measured=captured_at, unit=Length.KM)
+                drive.range.precision = 1
+    
+            # flat mileage fallback (some datasets only provide this)
+            flat_mileage = dataset.value_of('mileage')
+            if flat_mileage is not None and mileage is None:
+                vehicle.odometer._set_value(value=flat_mileage, measured=captured_at, unit=Length.KM)
+                vehicle.odometer.precision = 1
 
     def _map_electric(self, vehicle: VWEudaElectricVehicle, dataset: Dataset,
                       captured_at: "Optional[datetime]") -> None:
