@@ -212,10 +212,12 @@ class EudaApiClient:
         self._session.mount("http://", adapter)
         self._email = email
         self._password = password
-        self._state = f"{country}__{language}__{brand}"
-        # Each brand authenticates with its own OIDC client_id (the state alone is
-        # not enough); resolve it from the brand key, defaulting to VW.
-        self._client_id = resolve_brand(brand).client_id
+        # Resolve the brand once: the OIDC state needs the canonical brand key
+        # (e.g. "CUPRA"), and each brand authenticates with its own client_id
+        # (the state alone is not enough). Accepts aliases / any case.
+        resolved = resolve_brand(brand)
+        self._state = f"{country}__{language}__{resolved.key}"
+        self._client_id = resolved.client_id
         self._timeout = timeout
         self._logged_in = False
 
