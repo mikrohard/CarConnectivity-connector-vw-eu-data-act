@@ -41,8 +41,9 @@ from carconnectivity_connectors.vw_eu_data_act.client import (
     ApiError, AuthError, EudaApiClient,
 )
 from carconnectivity_connectors.vw_eu_data_act.dataset import (
-    Dataset, parse_timestamp, resolve_charge_rate_unit, resolve_distance_unit,
+    Dataset, decikelvin_to_celsius, parse_timestamp, resolve_charge_rate_unit, resolve_distance_unit,
 )
+from carconnectivity_connectors.vw_eu_data_act.brands import resolve_brand
 from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
 
 if TYPE_CHECKING:
@@ -163,6 +164,14 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'mileage',
     'state_of_charge',
     'cruising_range_primary_engine',
+    # Maintenance / climate / ambient (mapped in _map_dataset).
+    'maintenance_interval__time_until_inspection',
+    'maintenance_interval__time_until_oil_change',
+    'maintenance_interval_distance_until_inspection',
+    'maintenance_interval_distance_until_oil_change',
+    'outside_temperature',
+    'remaining_climate_time',
+    'remaining_climatisation_time',
 }
 
 
@@ -350,6 +359,10 @@ class Connector(BaseConnector):
             if vehicle is None:
                 vehicle = VWEudaVehicle(vin=vin, garage=garage, managing_connector=self,
                                         initialization=garage.get_initialization(vin))
+                # Label the manufacturer from the configured brand (Volkswagen,
+                # Audi, Skoda, SEAT, Cupra, Bentley, ...) instead of always "Volkswagen".
+                vehicle.manufacturer._set_value(  # pylint: disable=protected-access
+                    resolve_brand(self.active_config['brand']).manufacturer)
                 garage.add_vehicle(vin, vehicle)
             if veh.get('nickname'):
                 vehicle.name._set_value(veh['nickname'])  # pylint: disable=protected-access
@@ -567,6 +580,46 @@ class Connector(BaseConnector):
         if isinstance(wh, str):
             vehicle.window_heatings.heating_state._set_value(  # pylint: disable=protected-access
                 WINDOW_HEATING_MAPPING.get(wh, WindowHeatings.HeatingState.UNKNOWN), measured=captured_at)
+
+        # Maintenance intervals. The portal encodes a signed countdown: a negative
+        # value is the amount still remaining, zero is due, a positive value is
+        # overdue. Expose the time interval as a concrete due date (which conveys
+        # overdue naturally as a past date) and the distance as remaining km.
+        if captured_at is not None:
+            insp_days = dataset.value_of('maintenance_interval__time_until_inspection')
+            if insp_days is not None:
+                vehicle.maintenance.inspection_due_at._set_value(  # pylint: disable=protected-access
+                    value=captured_at + timedelta(days=-insp_days), measured=captured_at)
+            oil_days = dataset.value_of('maintenance_interval__time_until_oil_change')
+            if oil_days is not None:
+                vehicle.maintenance.oil_service_due_at._set_value(  # pylint: disable=protected-access
+                    value=captured_at + timedelta(days=-oil_days), measured=captured_at)
+        insp_dist = dataset.value_of('maintenance_interval_distance_until_inspection')
+        if insp_dist is not None:
+            vehicle.maintenance.inspection_due_after._set_value(  # pylint: disable=protected-access
+                value=abs(insp_dist), measured=captured_at, unit=Length.KM)
+        oil_dist = dataset.value_of('maintenance_interval_distance_until_oil_change')
+        if oil_dist is not None:
+            vehicle.maintenance.oil_service_due_after._set_value(  # pylint: disable=protected-access
+                value=abs(oil_dist), measured=captured_at, unit=Length.KM)
+
+        # Outside (ambient) temperature, reported in deci-Kelvin.
+        outside = decikelvin_to_celsius(dataset.value_of('outside_temperature'))
+        if outside is not None:
+            vehicle.outside_temperature._set_value(value=outside, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
+
+        # Remaining climatisation time -> estimated completion date. The dotted
+        # format delivers "<seconds>s"; the flat PHEV format delivers integer
+        # minutes (remaining_climatisation_time).
+        if captured_at is not None:
+            clim_seconds = dataset.value_of('remaining_climate_time')
+            clim_minutes = dataset.value_of('remaining_climatisation_time')
+            if clim_seconds is not None:
+                vehicle.climatization.estimated_date_reached._set_value(  # pylint: disable=protected-access
+                    value=captured_at + timedelta(seconds=clim_seconds), measured=captured_at)
+            elif clim_minutes is not None:
+                vehicle.climatization.estimated_date_reached._set_value(  # pylint: disable=protected-access
+                    value=captured_at + timedelta(minutes=clim_minutes), measured=captured_at)
 
         if isinstance(vehicle, VWEudaElectricVehicle):
             self._map_electric(vehicle, dataset, captured_at)

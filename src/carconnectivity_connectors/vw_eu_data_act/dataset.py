@@ -120,6 +120,20 @@ def resolve_charge_rate_unit(enum_value, default=None):
     return default
 
 
+def decikelvin_to_celsius(value) -> Optional[float]:
+    """Convert a deci-Kelvin reading (e.g. 3061) to Celsius (33.0).
+
+    The portal reports outside_temperature in deci-Kelvin: degC = dK / 10 - 273.15.
+    Returns ``None`` for missing or non-numeric input.
+    """
+    if value is None:
+        return None
+    try:
+        return round(float(value) / 10 - 273.15, 1)
+    except (TypeError, ValueError):
+        return None
+
+
 # Ordered enum members (protobuf index order) for the curated enum fields this
 # connector maps, lifted from the VW EU Data Act data dictionary. The full
 # 1000-field dictionary is intentionally not shipped (see module docstring);

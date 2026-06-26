@@ -22,6 +22,8 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from carconnectivity_connectors.vw_eu_data_act.brands import resolve_brand
+
 LOG: logging.Logger = logging.getLogger("carconnectivity.connectors.vw_eu_data_act-api-debug")
 
 # --- Portal / OIDC endpoints ----------------------------------------------
@@ -211,6 +213,9 @@ class EudaApiClient:
         self._email = email
         self._password = password
         self._state = f"{country}__{language}__{brand}"
+        # Each brand authenticates with its own OIDC client_id (the state alone is
+        # not enough); resolve it from the brand key, defaulting to VW.
+        self._client_id = resolve_brand(brand).client_id
         self._timeout = timeout
         self._logged_in = False
 
@@ -315,7 +320,7 @@ class EudaApiClient:
     def _build_authorize_url(self) -> str:
         """Construct the OIDC authorize URL (bypasses the broken AEM servlet)."""
         params = {
-            "client_id": OIDC_CLIENT_ID,
+            "client_id": self._client_id,
             "response_type": "code",
             "scope": OIDC_SCOPE,
             "state": self._state,
