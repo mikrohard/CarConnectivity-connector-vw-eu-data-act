@@ -585,15 +585,17 @@ class Connector(BaseConnector):
         # value is the amount still remaining, zero is due, a positive value is
         # overdue. Expose the time interval as a concrete due date (which conveys
         # overdue naturally as a past date) and the distance as remaining km.
-        if captured_at is not None:
-            insp_days = dataset.value_of('maintenance_interval__time_until_inspection')
-            if insp_days is not None:
-                vehicle.maintenance.inspection_due_at._set_value(  # pylint: disable=protected-access
-                    value=captured_at + timedelta(days=-insp_days), measured=captured_at)
-            oil_days = dataset.value_of('maintenance_interval__time_until_oil_change')
-            if oil_days is not None:
-                vehicle.maintenance.oil_service_due_at._set_value(  # pylint: disable=protected-access
-                    value=captured_at + timedelta(days=-oil_days), measured=captured_at)
+        # The bootstrap-merged dataset can lack a capture time, so anchor the due
+        # date on "now" when captured_at is absent.
+        date_anchor = captured_at or datetime.now(tz=timezone.utc)
+        insp_days = dataset.value_of('maintenance_interval__time_until_inspection')
+        if insp_days is not None:
+            vehicle.maintenance.inspection_due_at._set_value(  # pylint: disable=protected-access
+                value=date_anchor + timedelta(days=-insp_days), measured=captured_at)
+        oil_days = dataset.value_of('maintenance_interval__time_until_oil_change')
+        if oil_days is not None:
+            vehicle.maintenance.oil_service_due_at._set_value(  # pylint: disable=protected-access
+                value=date_anchor + timedelta(days=-oil_days), measured=captured_at)
         insp_dist = dataset.value_of('maintenance_interval_distance_until_inspection')
         if insp_dist is not None:
             vehicle.maintenance.inspection_due_after._set_value(  # pylint: disable=protected-access
@@ -611,15 +613,14 @@ class Connector(BaseConnector):
         # Remaining climatisation time -> estimated completion date. The dotted
         # format delivers "<seconds>s"; the flat PHEV format delivers integer
         # minutes (remaining_climatisation_time).
-        if captured_at is not None:
-            clim_seconds = dataset.value_of('remaining_climate_time')
-            clim_minutes = dataset.value_of('remaining_climatisation_time')
-            if clim_seconds is not None:
-                vehicle.climatization.estimated_date_reached._set_value(  # pylint: disable=protected-access
-                    value=captured_at + timedelta(seconds=clim_seconds), measured=captured_at)
-            elif clim_minutes is not None:
-                vehicle.climatization.estimated_date_reached._set_value(  # pylint: disable=protected-access
-                    value=captured_at + timedelta(minutes=clim_minutes), measured=captured_at)
+        clim_seconds = dataset.value_of('remaining_climate_time')
+        clim_minutes = dataset.value_of('remaining_climatisation_time')
+        if clim_seconds is not None:
+            vehicle.climatization.estimated_date_reached._set_value(  # pylint: disable=protected-access
+                value=date_anchor + timedelta(seconds=clim_seconds), measured=captured_at)
+        elif clim_minutes is not None:
+            vehicle.climatization.estimated_date_reached._set_value(  # pylint: disable=protected-access
+                value=date_anchor + timedelta(minutes=clim_minutes), measured=captured_at)
 
         if isinstance(vehicle, VWEudaElectricVehicle):
             self._map_electric(vehicle, dataset, captured_at)
