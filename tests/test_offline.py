@@ -686,3 +686,117 @@ def test_flat_data_egolf_payload_promotes_and_maps(connector):
     assert drive.level.value == 26
     assert drive.range.value == 67
     assert drive.range.unit == Length.KM
+
+
+def test_phev_promotes_to_hybrid_and_maps_both_drives(connector):
+    """A dataset with both battery and fuel fields -> HybridVehicle with two drives."""
+    from carconnectivity.vehicle import HybridVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "state_of_charge", "value": "25"},
+        {"key": "b", "dataFieldName": "cruising_range_secondary_engine", "value": "11"},
+        {"key": "c", "dataFieldName": "long_term_data_average_electr_engine_consumption", "value": "160"},
+        {"key": "d", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "e", "dataFieldName": "cruising_range_primary_engine", "value": "210"},
+        {"key": "f", "dataFieldName": "long_term_data_average_fuel_consumption", "value": "14"},
+    ]})
+    connector._map_dataset(VIN, ds)
+    v = garage.get_vehicle(VIN)
+    assert isinstance(v, HybridVehicle)
+    electric = v.get_electric_drive()
+    combustion = v.get_combustion_drive()
+    assert electric.level.value == 25 and electric.range.value == 11
+    assert electric.consumption.value == 16.0   # 160 kWh/1000km -> 16.0 kWh/100km
+    assert combustion.level.value == 37 and combustion.range.value == 210
+    assert combustion.consumption.value == 1.4   # 14 L/1000km -> 1.4 L/100km
+
+
+def test_pure_ev_stays_electric_not_hybrid(connector):
+    """A battery-only dataset stays a pure electric vehicle (no combustion drive)."""
+    from carconnectivity.vehicle import CombustionVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "battery_state_report.soc", "value": "69"},
+        {"key": "b", "dataFieldName": "range", "value": "312"},
+    ]})
+    connector._map_dataset(VIN, ds)
+    v = garage.get_vehicle(VIN)
+    assert not isinstance(v, CombustionVehicle)
+    assert v.get_electric_drive().level.value == 69
+
+
+def test_diesel_creates_dieseldrive_and_maps_adblue(connector):
+    """A diesel dataset (numeric scr_range) must create a DieselDrive, because
+    adblue_range exists only there. Writing it on a plain CombustionDrive (the
+    previous behaviour) raised AttributeError on real diesels."""
+    from carconnectivity.drive import DieselDrive
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "60"},
+        {"key": "b", "dataFieldName": "cruising_range_primary_engine", "value": "700"},
+        {"key": "c", "dataFieldName": "scr_range", "value": "9000"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_combustion_drive()
+    assert isinstance(drive, DieselDrive)
+    assert str(drive.type.value) == "Type.DIESEL"
+    assert drive.adblue_range.value == 9000
+    assert drive.adblue_range.unit == Length.KM
+
+
+def test_petrol_empty_scr_range_stays_combustion_no_crash(connector):
+    """Petrol/PHEV cars also carry the scr_range field but report it as an empty
+    string. That must NOT be read as diesel (no DieselDrive) and must not raise."""
+    from carconnectivity.drive import CombustionDrive, DieselDrive
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "b", "dataFieldName": "cruising_range_primary_engine", "value": "210"},
+        {"key": "c", "dataFieldName": "scr_range", "value": ""},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_combustion_drive()
+    assert isinstance(drive, CombustionDrive)
+    assert not isinstance(drive, DieselDrive)
+    assert str(drive.type.value) == "Type.GASOLINE"
+
+
+PHEV_SAMPLE = os.path.join(os.path.dirname(__file__), "phev_sample_dataset.json")
+
+
+def test_phev_real_world_sample(connector):
+    """Full mapping against an anonymised real flat SEAT Leon PHEV dataset."""
+    from carconnectivity.vehicle import HybridVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    payload = json.load(open(PHEV_SAMPLE, "r", encoding="utf-8"))
+    payload["vin"] = VIN
+    connector._map_dataset(VIN, Dataset.from_json(payload))
+    v = garage.get_vehicle(VIN)
+
+    assert isinstance(v, HybridVehicle)
+    # primary slot = petrol (combustion), secondary = electric (seatcupra convention)
+    primary = v.drives.drives["primary"]
+    secondary = v.drives.drives["secondary"]
+    assert str(primary.type.value) == "Type.GASOLINE"
+    assert str(secondary.type.value) == "Type.ELECTRIC"
+    assert primary.range.value == 210 and primary.level.value == 37        # petrol
+    assert secondary.range.value == 11 and secondary.level.value == 25     # electric
+    assert primary.consumption.value == 1.4                               # L/100km
+    assert secondary.consumption.value == 16.0                            # kWh/100km
+    # vehicle-level
+    assert v.odometer.value == 40208
+    assert v.outside_temperature.value == 39.0
+    # status objects populated
+    assert len(v.doors.doors) == 6
+    assert v.doors.doors["front_right"].open_state.value.value == "open"
+    assert len(v.windows.windows) == 5
+    assert v.lights.lights["parking"].light_state.value.value == "off"
+    # maintenance distance preserved
+    assert v.maintenance.inspection_due_after.value == 23500
