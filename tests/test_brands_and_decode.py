@@ -93,6 +93,24 @@ def test_door_window_light_decoding():
     assert Lights.LightState(_light_code(2)) is Lights.LightState.OFF
 
 
+def test_window_opening_percentage_decoding():
+    """Window opening: percentage preferred (closed/ajar/open), state_* as fallback."""
+    from carconnectivity.windows import Windows
+    from carconnectivity_connectors.vw_eu_data_act.connector import _window_open_code
+
+    # percentage drives closed (0) / ajar (1..99) / open (100)
+    assert _window_open_code(0, None) == 'closed'
+    assert _window_open_code(42, None) == 'ajar'
+    assert _window_open_code(100, None) == 'open'
+    assert _window_open_code("0", None) == 'closed'   # portal sends strings
+    # out-of-range / missing percentage falls back to the coarse state code
+    assert _window_open_code(None, 2) == 'open'
+    assert _window_open_code(None, 3) == 'closed'
+    assert _window_open_code(None, None) is None
+    # decoded strings are valid enum values, including ajar
+    assert Windows.OpenState(_window_open_code(42, None)) is Windows.OpenState.AJAR
+
+
 def test_dataset_parses_maintenance_and_climate_fields():
     ds = Dataset.from_json({"vin": "V", "Data": [
         {"key": "a", "dataFieldName": "maintenance_interval__time_until_inspection", "value": "-127"},

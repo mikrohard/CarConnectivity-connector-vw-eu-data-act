@@ -205,6 +205,9 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'state_front_left_door_window_lifter', 'state_front_right_door_window_lifter',
     'state_rear_left_door_window_lifter', 'state_rear_right_door_window_lifter',
     'state_sunroof_motor_hood_1',
+    'position_front_left_door_window_lifter', 'position_front_right_door_window_lifter',
+    'position_rear_left_door_window_lifter', 'position_rear_right_door_window_lifter',
+    'position_sunroof_motor_hood_1',
 }
 
 # Portal door id -> (open_state field, locked_state field). Note the double
@@ -218,13 +221,17 @@ _DOOR_FIELDS: "Dict[str, Tuple[str, str]]" = {
     'tailgate': ('open_state_tailgate', 'locked_state_tailgate'),
 }
 
-# Portal window id -> open/closed state field.
-_WINDOW_FIELDS: "Dict[str, str]" = {
-    'front_left': 'state_front_left_door_window_lifter',
-    'front_right': 'state_front_right_door_window_lifter',
-    'rear_left': 'state_rear_left_door_window_lifter',
-    'rear_right': 'state_rear_right_door_window_lifter',
-    'sunroof': 'state_sunroof_motor_hood_1',
+# Portal window id -> (opening-percentage field, open/closed state field).
+# The portal exposes both: position_* is the opening percentage (unit '%', 0 =
+# closed) and state_* is the coarse open/closed code. We prefer the percentage
+# because it also lets us tell a partly-open (ajar) window from a fully open one;
+# state_* is the fallback when the percentage is missing.
+_WINDOW_FIELDS: "Dict[str, Tuple[str, str]]" = {
+    'front_left': ('position_front_left_door_window_lifter', 'state_front_left_door_window_lifter'),
+    'front_right': ('position_front_right_door_window_lifter', 'state_front_right_door_window_lifter'),
+    'rear_left': ('position_rear_left_door_window_lifter', 'state_rear_left_door_window_lifter'),
+    'rear_right': ('position_rear_right_door_window_lifter', 'state_rear_right_door_window_lifter'),
+    'sunroof': ('position_sunroof_motor_hood_1', 'state_sunroof_motor_hood_1'),
 }
 
 
@@ -235,6 +242,27 @@ def _open_code(value) -> "Optional[str]":
     if value == 3:
         return 'closed'
     return None
+
+
+def _window_open_code(position, state) -> "Optional[str]":
+    """Decode a window opening from the portal.
+
+    The percentage (position_*, 0..100) is preferred: 0 = closed, 100 = open,
+    anything in between = ajar (CarConnectivity has no numeric window position,
+    only an open/closed/ajar enum). When the percentage is absent or out of range
+    fall back to the coarse state_* open/closed code.
+    """
+    try:
+        pct = float(position)
+    except (TypeError, ValueError):
+        pct = None
+    if pct is not None and 0 <= pct <= 100:
+        if pct <= 0:
+            return 'closed'
+        if pct >= 100:
+            return 'open'
+        return 'ajar'
+    return _open_code(state)
 
 
 def _lock_code(value) -> "Optional[str]":
@@ -930,9 +958,10 @@ class Connector(BaseConnector):
         if vehicle.doors.doors:
             vehicle.doors.enabled = True
 
-        # Per-window open state.
-        for window_id, state_f in _WINDOW_FIELDS.items():
-            open_code = _open_code(dataset.value_of(state_f))
+        # Per-window open state, preferring the opening percentage (which also
+        # surfaces an ajar window) over the coarse open/closed code.
+        for window_id, (position_f, state_f) in _WINDOW_FIELDS.items():
+            open_code = _window_open_code(dataset.value_of(position_f), dataset.value_of(state_f))
             if open_code is None:
                 continue
             window = vehicle.windows.windows.get(window_id)
