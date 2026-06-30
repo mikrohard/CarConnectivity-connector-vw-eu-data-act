@@ -22,7 +22,7 @@ from datetime import datetime, timedelta, timezone
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
 from carconnectivity.units import Length, Power, Speed, Temperature
-from carconnectivity.attributes import DurationAttribute, EnumAttribute
+from carconnectivity.attributes import DurationAttribute, EnumAttribute, StringAttribute
 from carconnectivity.vehicle import GenericVehicle
 from carconnectivity.drive import ElectricDrive, GenericDrive
 from carconnectivity.battery import Battery
@@ -159,6 +159,12 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'charging_state_report.charge_type',
     'settings.target_soc',
     'car_captured_time',
+    'settings.charge_mode_selection',
+    'outdoor_temperature',
+    'remaining_climate_time',
+    'parking_brake',
+    #unknown meaning
+    'open',
     # Flat-format (eGolf) fields handled in _map_dataset.
     'mileage',
     'state_of_charge',
@@ -561,13 +567,36 @@ class Connector(BaseConnector):
         if isinstance(locked, bool):
             vehicle.doors.lock_state._set_value(  # pylint: disable=protected-access
                 Doors.LockState.LOCKED if locked else Doors.LockState.UNLOCKED, measured=captured_at)
+                
+        #Unknown what "open" refers to - currently map to doors
+        open = dataset.value_of('open')
+        if isinstance(open, bool):
+            vehicle.doors.open_state._set_value(  # pylint: disable=protected-access
+                Doors.OpenState.OPEN if open else Doors.OpenState.CLOSED, measured=captured_at)
+                
+        #Climate time
+        climate_timeremain = dataset.value_of('remaining_climate_time')
+        if climate_timeremain is not None:
+            vehicle.climatization.estimated_date_reached._set_value(  # pylint: disable=protected-access
+                 value=captured_at + timedelta(seconds=climate_timeremain), measured=captured_at)
 
+        # Parking_brake
+        pb = dataset.value_of('parking_brake')
+        if isinstance(pb, bool):
+            vehicle.position.position_type._set_value(  # pylint: disable=protected-access
+                'parked' if pb else 'moving', measured=captured_at)
+                
         # Window heating state
         wh = dataset.value_of('window_heating_state')
         if isinstance(wh, str):
             vehicle.window_heatings.heating_state._set_value(  # pylint: disable=protected-access
                 WINDOW_HEATING_MAPPING.get(wh, WindowHeatings.HeatingState.UNKNOWN), measured=captured_at)
-
+               
+        # Outside_temperature
+        outside_temp = dataset.value_of('outdoor_temperature')
+        if outside_temp is not None:
+            vehicle.outside_temperature._set_value(value=outside_temp, measured=captured_at)
+            
         if isinstance(vehicle, VWEudaElectricVehicle):
             self._map_electric(vehicle, dataset, captured_at)
 
@@ -619,24 +648,22 @@ class Connector(BaseConnector):
             drive.range.precision = 1
 
         # Battery temperature min/max (°C)
-        battery: Battery = drive.battery
         tmin = dataset.value_of('min_temperature')
         if tmin is not None:
-            battery.temperature_min._set_value(value=tmin, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
+            drive.battery.temperature_min._set_value(value=tmin, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
         tmax = dataset.value_of('max_temperature')
         if tmax is not None:
-            battery.temperature_max._set_value(value=tmax, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
+            drive.battery.temperature_max._set_value(value=tmax, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
 
         # Charging power (kW)
         power = dataset.value_of('battery_state_report.charge_power')
         if power is not None:
             vehicle.charging.power._set_value(value=power, measured=captured_at, unit=Power.KW)  # pylint: disable=protected-access
 
-        # Charging state
-        charge_state = dataset.value_of('charging_state_report.current_charge_state')
-        if isinstance(charge_state, str):
-            vehicle.charging.state._set_value(  # pylint: disable=protected-access
-                CHARGE_STATE_MAPPING.get(charge_state, Charging.ChargingState.UNKNOWN), measured=captured_at)
+        #Charging state
+        chargestate = dataset.value_of('charging_state_report.current_charge_state')
+        if chargestate is not None:
+            vehicle.charging.state._set_value(value=chargestate, measured=captured_at)
 
         # Charge type (what the car is plugged into: AC / DC / off)
         charge_type = dataset.value_of('charging_state_report.charge_type')
@@ -664,6 +691,20 @@ class Connector(BaseConnector):
         target_soc = dataset.value_of('settings.target_soc')
         if target_soc is not None:
             vehicle.charging.settings.target_level._set_value(value=target_soc, measured=captured_at)  # pylint: disable=protected-access
+       
+        # Charge mode - extra attribute, not present in normal CarConnectivity
+        charge_mode = dataset.value_of('settings.charge_mode_selection')
+        if charge_mode is not None:
+            if not hasattr(vehicle.charging.settings, 'charge_mode'):
+                vehicle.charging.settings.charge_mode = StringAttribute(
+                    name='charge_mode',
+                    parent=vehicle.charging.settings,
+                    tags={'connector_custom'}
+               )
+            vehicle.charging.settings.charge_mode._set_value(
+                value=str(charge_mode),
+                measured=captured_at
+            )
 
     # -- scheduling --------------------------------------------------------
 
