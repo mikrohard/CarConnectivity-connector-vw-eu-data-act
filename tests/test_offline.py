@@ -22,7 +22,10 @@ import requests
 from carconnectivity.units import Length, Speed
 
 from carconnectivity_connectors.vw_eu_data_act.client import ApiError, EudaApiClient
-from carconnectivity_connectors.vw_eu_data_act.connector import Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS
+from carconnectivity_connectors.vw_eu_data_act.connector import (
+    Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS,
+    _charge_mode, _charge_mode_flat, VWEudaChargeMode,
+)
 from carconnectivity_connectors.vw_eu_data_act.dataset import Dataset
 from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
 
@@ -800,3 +803,77 @@ def test_phev_real_world_sample(connector):
     assert v.lights.lights["parking"].light_state.value.value == "off"
     # maintenance distance preserved
     assert v.maintenance.inspection_due_after.value == 23500
+
+
+def test_charge_mode_normalisation():
+    """_charge_mode maps the data-dictionary tokens (with or without the
+    CHARGE_MODE_SELECTION_ prefix) to the enum, None stays None, unknown -> UNKNOWN."""
+    assert _charge_mode(None) is None
+    assert _charge_mode("") is None
+    assert _charge_mode("CHARGE_MODE_SELECTION_TIMERCHARGING") == VWEudaChargeMode.TIMER
+    assert _charge_mode("CHARGE_MODE_SELECTION_TIMER_CHARGING_CLIMATIZATION") \
+        == VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION
+    assert _charge_mode("CHARGE_MODE_SELECTION_PREFERRED_CHARGING_TIMES") \
+        == VWEudaChargeMode.PREFERRED_CHARGING_TIMES
+    assert _charge_mode("manual") == VWEudaChargeMode.MANUAL
+    assert _charge_mode("timer") == VWEudaChargeMode.TIMER
+    assert _charge_mode("something_new") == VWEudaChargeMode.UNKNOWN
+
+
+def test_charge_mode_dotted_mapping(connector):
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "settings.charge_mode_selection",
+             "value": "CHARGE_MODE_SELECTION_PREFERRED_CHARGING_TIMES"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.settings.charge_mode.value == VWEudaChargeMode.PREFERRED_CHARGING_TIMES
+
+
+def test_charge_mode_flat_options_mapping(connector):
+    """Flat/continuous format: the active per-option boolean wins."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "charge_mode_selection_options.manual", "value": "false"},
+            {"key": "k2", "dataFieldName": "charge_mode_selection_options.timer_charging", "value": "true"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.settings.charge_mode.value == VWEudaChargeMode.TIMER
+
+
+def test_charge_mode_absent_leaves_attribute_unset(connector):
+    """A vehicle that does not report the field gets no charge_mode attribute
+    (no regression on brands/platforms without it, e.g. many VWs)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "mileage.value", "value": "100"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert getattr(v.charging.settings, "charge_mode", None) is None

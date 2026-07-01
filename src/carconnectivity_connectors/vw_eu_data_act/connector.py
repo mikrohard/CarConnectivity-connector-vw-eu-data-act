@@ -18,6 +18,7 @@ import os
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
@@ -164,6 +165,7 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'charging_state_report.current_charge_state',
     'charging_state_report.charge_type',
     'settings.target_soc',
+    'settings.charge_mode_selection',
     'car_captured_time',
     # Flat-format (eGolf) fields handled in _map_dataset.
     'mileage',
@@ -180,6 +182,14 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     # Flat-format charging + consumption (mapped in _map_electric).
     'charging_state',
     'charging_mode',
+    'charge_mode_selection_options.manual',
+    'charge_mode_selection_options.timer_charging',
+    'charge_mode_selection_options.timer_charging_climatization',
+    'charge_mode_selection_options.preferred_charging_times',
+    'charge_mode_selection_options.only_own_current',
+    'charge_mode_selection_options.home_storage_charging',
+    'charge_mode_selection_options.immediate_charging',
+    'charge_mode_selection_options.immediate_discharging',
     'plug_state',
     'external_power_supply_state',
     'remaining_charging_time',
@@ -271,6 +281,96 @@ def _lock_code(value) -> "Optional[str]":
         return 'locked'
     if value == 3:
         return 'unlocked'
+    return None
+
+
+class VWEudaChargeMode(Enum):
+    """Selected charge mode reported by the portal (``charge_mode_selection``).
+
+    Read-only. The field is the *selected* charge mode (one of its values is
+    itself ``preferred_charging_times``), so the attribute is named ``charge_mode``
+    rather than "preferred". Member names/values follow the EU Data Act data
+    dictionary options and mirror the seatcupra/skoda connector enum, so consumers
+    see a consistent set across brands.
+    """
+    MANUAL = 'manual'
+    TIMER = 'timer'
+    TIMER_CHARGING_WITH_CLIMATISATION = 'timer_charging_with_climatisation'
+    PREFERRED_CHARGING_TIMES = 'preferred_charging_times'
+    ONLY_OWN_CURRENT = 'only_own_current'
+    HOME_STORAGE_CHARGING = 'home_storage_charging'
+    IMMEDIATE_CHARGING = 'immediate_charging'
+    IMMEDIATE_DISCHARGING = 'immediate_discharging'
+    OFF = 'off'
+    INVALID = 'invalid'
+    UNKNOWN = 'unknown charge mode'
+
+
+# Dotted format: a single 'settings.charge_mode_selection' value. Normalised token
+# (upper-case, optional CHARGE_MODE_SELECTION_ prefix stripped) -> enum.
+_CHARGE_MODE_TOKENS = {
+    'MANUAL': VWEudaChargeMode.MANUAL,
+    'TIMER': VWEudaChargeMode.TIMER,
+    'TIMERCHARGING': VWEudaChargeMode.TIMER,
+    'TIMER_CHARGING': VWEudaChargeMode.TIMER,
+    'IMMEDIATECHARGING': VWEudaChargeMode.IMMEDIATE_CHARGING,
+    'IMMEDIATE_CHARGING': VWEudaChargeMode.IMMEDIATE_CHARGING,
+    'TIMER_CHARGING_CLIMATIZATION': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'TIMER_CHARGING_CLIMATISATION': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'TIMER_CHARGING_WITH_CLIMATISATION': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'PREFERRED_CHARGING_TIMES': VWEudaChargeMode.PREFERRED_CHARGING_TIMES,
+    'ONLY_OWN_CURRENT': VWEudaChargeMode.ONLY_OWN_CURRENT,
+    'HOME_STORAGE_CHARGING': VWEudaChargeMode.HOME_STORAGE_CHARGING,
+    'IMMEDIATE_DISCHARGING': VWEudaChargeMode.IMMEDIATE_DISCHARGING,
+    'OFF': VWEudaChargeMode.OFF,
+    'INVALID': VWEudaChargeMode.INVALID,
+}
+
+# Flat/continuous format: one boolean per option
+# (charge_mode_selection_options.<suffix>); the active one wins.
+_CHARGE_MODE_FLAT = {
+    'manual': VWEudaChargeMode.MANUAL,
+    'timer_charging': VWEudaChargeMode.TIMER,
+    'timer_charging_climatization': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'preferred_charging_times': VWEudaChargeMode.PREFERRED_CHARGING_TIMES,
+    'only_own_current': VWEudaChargeMode.ONLY_OWN_CURRENT,
+    'home_storage_charging': VWEudaChargeMode.HOME_STORAGE_CHARGING,
+    'immediate_charging': VWEudaChargeMode.IMMEDIATE_CHARGING,
+    'immediate_discharging': VWEudaChargeMode.IMMEDIATE_DISCHARGING,
+}
+
+
+def _charge_mode(raw) -> "Optional[VWEudaChargeMode]":
+    """Normalise a dotted ``charge_mode_selection`` value to VWEudaChargeMode.
+
+    Returns None when there is nothing to map (absent/empty) and ``UNKNOWN`` when
+    a value is present but unrecognised, so a new value is surfaced rather than
+    silently dropped.
+    """
+    if raw is None:
+        return None
+    token = str(raw).strip().upper()
+    if not token:
+        return None
+    if token.startswith('CHARGE_MODE_SELECTION_'):
+        token = token[len('CHARGE_MODE_SELECTION_'):]
+    return _CHARGE_MODE_TOKENS.get(token, VWEudaChargeMode.UNKNOWN)
+
+
+def _charge_mode_flat(dataset) -> "Optional[VWEudaChargeMode]":
+    """Pick the active charge mode from the flat per-option booleans."""
+    for suffix, mode in _CHARGE_MODE_FLAT.items():
+        value = dataset.value_of(f'charge_mode_selection_options.{suffix}')
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            active = value
+        elif isinstance(value, (int, float)):
+            active = value != 0
+        else:
+            active = str(value).strip().lower() in ('true', '1', 'yes', 'on')
+        if active:
+            return mode
     return None
 
 
@@ -877,6 +977,24 @@ class Connector(BaseConnector):
         target_soc = dataset.value_of('settings.target_soc')
         if target_soc is not None:
             vehicle.charging.settings.target_level._set_value(value=target_soc, measured=captured_at)  # pylint: disable=protected-access
+
+        # Selected charge mode (charge_mode_selection). The dotted format carries a
+        # single value; the flat/continuous format splits it into one boolean per
+        # option, of which the active one is set. Neutral name `charge_mode`: the
+        # field is the *selected* mode (one value being `preferred_charging_times`),
+        # not necessarily a "preferred" one. Read-only, no commands here. The
+        # attribute is created lazily and tagged connector_custom (no core model).
+        charge_mode = _charge_mode(dataset.value_of('settings.charge_mode_selection'))
+        if charge_mode is None:
+            charge_mode = _charge_mode_flat(dataset)
+        if charge_mode is not None:
+            settings = vehicle.charging.settings
+            charge_mode_attr = getattr(settings, 'charge_mode', None)
+            if not isinstance(charge_mode_attr, EnumAttribute):
+                charge_mode_attr = EnumAttribute(name='charge_mode', parent=settings,
+                                                 value_type=VWEudaChargeMode, tags={'connector_custom'})
+                settings.charge_mode = charge_mode_attr
+            charge_mode_attr._set_value(charge_mode, measured=captured_at)  # pylint: disable=protected-access
 
         # --- Flat-format charging fields (eGolf / PHEV) ----------------------
         # Mirror the dotted battery_state_report.* / charging_state_report.* fields
