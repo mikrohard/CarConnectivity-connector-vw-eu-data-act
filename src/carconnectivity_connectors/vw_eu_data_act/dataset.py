@@ -299,6 +299,21 @@ class Dataset:
         dp = self.by_field(field_name)
         return dp.value if dp is not None else None
 
+    def freshest_numeric_by_prefix(self, prefix: str):
+        """Return a numeric value among fields whose name starts with ``prefix``.
+
+        Used when the exact leaf of a nested field name is not confirmed ahead of
+        time (e.g. ``energy_contents.maximal_energy_content.<leaf>``); the numeric
+        filter naturally skips companion enum / metadata sub-fields such as
+        ``.value_type``. Among several matches the smallest ``key`` (UUID) wins,
+        the same stable choice as :meth:`by_field`.
+        """
+        matches = [dp for dp in self.points.values()
+                   if dp.field_name.startswith(prefix)
+                   and isinstance(dp.value, (int, float)) and not isinstance(dp.value, bool)]
+        return min(matches, key=lambda dp: dp.key).value if matches else None
+
+
     @property
     def field_names(self) -> set:
         return {dp.field_name for dp in self.points.values()}

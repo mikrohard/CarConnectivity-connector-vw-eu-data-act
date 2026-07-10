@@ -877,3 +877,41 @@ def test_charge_mode_absent_leaves_attribute_unset(connector):
 
     v = garage.get_vehicle(VIN)
     assert getattr(v.charging.settings, "charge_mode", None) is None
+
+
+def test_freshest_numeric_by_prefix_skips_enum_companion():
+    """The prefix lookup returns the numeric physicalValue and skips the
+    companion value_type enum; unknown prefixes return None."""
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "energy_contents.maximal_energy_content.value_type",
+             "value": "SOME_ENUM"},
+            {"key": "k2", "dataFieldName": "energy_contents.maximal_energy_content.physicalValue",
+             "value": "128"},
+        ]
+    })
+    assert ds.freshest_numeric_by_prefix("energy_contents.maximal_energy_content") == 128
+    assert ds.freshest_numeric_by_prefix("energy_contents.current_energy_content") is None
+
+
+def test_battery_available_capacity_mapping(connector):
+    """maximal_energy_content maps to battery.available_capacity in kWh (value/10)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+            {"key": "k2", "dataFieldName": "energy_contents.maximal_energy_content.physicalValue",
+             "value": "128"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_electric_drive()
+    assert drive is not None
+    assert drive.battery.available_capacity.value == 12.8  # 128 / 10 kWh

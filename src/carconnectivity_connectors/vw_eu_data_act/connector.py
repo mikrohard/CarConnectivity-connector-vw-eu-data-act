@@ -22,7 +22,7 @@ from enum import Enum
 
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
-from carconnectivity.units import EnergyConsumption, FuelConsumption, Length, Power, Speed, Temperature
+from carconnectivity.units import Energy, EnergyConsumption, FuelConsumption, Length, Power, Speed, Temperature
 from carconnectivity.attributes import DurationAttribute, EnumAttribute
 from carconnectivity.vehicle import GenericVehicle, ElectricVehicle, CombustionVehicle
 from carconnectivity.drive import CombustionDrive, DieselDrive, ElectricDrive, GenericDrive
@@ -219,6 +219,13 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'position_rear_left_door_window_lifter', 'position_rear_right_door_window_lifter',
     'position_sunroof_motor_hood_1',
 }
+
+# Field-name prefixes whose subtree is mapped even though the exact leaf name is
+# not pinned (e.g. energy_contents.maximal_energy_content.<leaf>, mapped by
+# prefix). Excluded from the unmapped-sensor detection like KNOWN_MAPPED_FIELDS.
+KNOWN_MAPPED_PREFIXES: "Tuple[str, ...]" = (
+    'energy_contents.maximal_energy_content',
+)
 
 # Portal door id -> (open_state field, locked_state field). Note the double
 # underscore in the rear-left lock field (portal quirk).
@@ -740,7 +747,8 @@ class Connector(BaseConnector):
     @staticmethod
     def _detect_unmapped_fields(vin: str, dataset: Dataset) -> None:
         """Log any field names in the dataset that are not yet mapped to CarConnectivity."""
-        unmapped = dataset.field_names - KNOWN_MAPPED_FIELDS
+        unmapped = {f for f in dataset.field_names
+                    if f not in KNOWN_MAPPED_FIELDS and not f.startswith(KNOWN_MAPPED_PREFIXES)}
         for field in sorted(unmapped):
             dp = dataset.by_field(field)
             raw = dp.raw_value if dp else '?'
@@ -939,6 +947,20 @@ class Connector(BaseConnector):
         tmax = dataset.value_of('max_temperature')
         if tmax is not None:
             battery.temperature_max._set_value(value=tmax, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
+
+        # Maximal (usable) battery energy content -> available_capacity (kWh).
+        # The portal reports energy_contents.maximal_energy_content.<leaf>: the
+        # dynamically measured usable capacity (degrades with battery age), the
+        # same concept the skoda connector fills from the static spec, so it backs
+        # a derivable state of health = available_capacity / total_capacity.
+        # Matched by prefix because the exact leaf is unconfirmed, which also skips
+        # the companion value_type enum. NOTE: the /10 scaling (deci-kWh) follows
+        # the request in issue #22 and is unverified against a real value. Absent
+        # on many vehicles (guarded).
+        max_energy = dataset.freshest_numeric_by_prefix('energy_contents.maximal_energy_content')
+        if isinstance(max_energy, (int, float)):
+            battery.available_capacity._set_value(  # pylint: disable=protected-access
+                value=max_energy / 10, measured=captured_at, unit=Energy.KWH)
 
         # Charging power (kW)
         power = dataset.value_of('battery_state_report.charge_power')
