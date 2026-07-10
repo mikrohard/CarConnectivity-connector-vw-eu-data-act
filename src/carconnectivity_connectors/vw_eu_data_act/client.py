@@ -44,7 +44,7 @@ DEFAULT_BRAND = "VOLKSWAGEN_PASSENGER_CARS"
 # proxy_api paths (relative to BASE_URL)
 VEHICLES_PATH = "/proxy_api/consent/me/vehicles"
 RELATION_PATH = "/proxy_api/vum/v2/users/me/relations/{vin}"
-METADATA_PATH = "/proxy_api/euda-apim/datarequest/vehicles/{vin}/metadata/partial"
+METADATA_PATH = "/proxy_api/euda-apim/datarequest/vehicles/{vin}/metadata/{request_type}"
 LIST_PATH = "/proxy_api/euda-apim/datadelivery/vehicles/{vin}/{identifier}/list"
 DOWNLOAD_PATH = "/proxy_api/euda-apim/datadelivery/vehicles/{vin}/{identifier}/download"
 
@@ -389,27 +389,32 @@ class EudaApiClient:
         headers = {"traceid": f"vehicle-relation-fetch-{uuid.uuid4()}"}
         return self._get_json(f"{BASE_URL}{RELATION_PATH.format(vin=vin)}", headers=headers)
 
-    def get_metadata(self, vin: str) -> dict:
-        """Return the data-request metadata; ``Identifier`` is needed downstream."""
-        self.ensure_login()
-        return self._get_json(f"{BASE_URL}{METADATA_PATH.format(vin=vin)}")
+    def get_metadata(self, vin: str, request_type: str = "partial") -> dict:
+        """Return the data-request metadata; ``Identifier`` is needed downstream.
 
-    def list_datasets(self, vin: str, identifier: str) -> List[dict]:
+        ``request_type`` selects the EU Data Act feed: ``"partial"`` (continuous,
+        the default) or ``"all"`` (on-demand historical export). Both live on the
+        same endpoint; only the ``metadata/{type}`` path segment changes.
+        """
+        self.ensure_login()
+        return self._get_json(f"{BASE_URL}{METADATA_PATH.format(vin=vin, request_type=request_type)}")
+
+    def list_datasets(self, vin: str, identifier: str, request_type: str = "partial") -> List[dict]:
         """Return the rolling list of available zips: [{name, createdOn, size}]."""
         self.ensure_login()
         url = f"{BASE_URL}{LIST_PATH.format(vin=vin, identifier=identifier)}"
-        # The list endpoint requires the data-request type header (matching
-        # metadata/partial); without it the backend returns HTTP 500.
-        data = self._get_json(url, headers={"type": "partial"})
+        # The list endpoint requires the data-request type header (matching the
+        # metadata request type); without it the backend returns HTTP 500.
+        data = self._get_json(url, headers={"type": request_type})
         return data if isinstance(data, list) else data.get("files", [])
 
-    def download_dataset(self, vin: str, identifier: str, name: str) -> dict:
+    def download_dataset(self, vin: str, identifier: str, name: str, request_type: str = "partial") -> dict:
         """Download a specific zip by name and return the parsed JSON inside it."""
         self.ensure_login()
         if name.endswith(NO_CONTENT_SUFFIX):
             raise ApiError(f"{name} contains no content")
         url = f"{BASE_URL}{DOWNLOAD_PATH.format(vin=vin, identifier=identifier)}"
-        headers = {"filename": name, "type": "partial"}
+        headers = {"filename": name, "type": request_type}
         resp = self._session_get(url, headers=headers)
         if resp.status_code in (401, 403):
             self._logged_in = False

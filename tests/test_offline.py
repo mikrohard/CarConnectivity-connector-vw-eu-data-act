@@ -877,3 +877,46 @@ def test_charge_mode_absent_leaves_attribute_unset(connector):
 
     v = garage.get_vehicle(VIN)
     assert getattr(v.charging.settings, "charge_mode", None) is None
+
+
+def test_request_type_threads_through_client(monkeypatch):
+    """client request_type defaults to 'partial' (unchanged behaviour) and, when
+    set to 'all', changes both the metadata path segment and the type header."""
+    from carconnectivity_connectors.vw_eu_data_act.client import EudaApiClient
+    client = EudaApiClient("user@example.com", "secret")
+    monkeypatch.setattr(client, "ensure_login", lambda: None)
+
+    seen = {}
+
+    def fake_get_json(url, *, headers=None, _retry=True):
+        seen["url"] = url
+        seen["headers"] = headers
+        return {"Identifier": "id"} if "metadata" in url else []
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+
+    client.get_metadata("VIN1")
+    assert seen["url"].endswith("/metadata/partial")
+    client.get_metadata("VIN1", "all")
+    assert seen["url"].endswith("/metadata/all")
+
+    client.list_datasets("VIN1", "id", "all")
+    assert seen["headers"] == {"type": "all"}
+    client.list_datasets("VIN1", "id")
+    assert seen["headers"] == {"type": "partial"}
+
+    captured = {}
+
+    class _FakeResp:
+        status_code = 200
+        content = b""
+
+    def fake_session_get(url, *, headers=None):
+        captured["headers"] = headers
+        return _FakeResp()
+    monkeypatch.setattr(client, "_session_get", fake_session_get)
+    monkeypatch.setattr(client, "_unzip_json", lambda content, name: {})
+
+    client.download_dataset("VIN1", "id", "file.zip", "all")
+    assert captured["headers"] == {"filename": "file.zip", "type": "all"}
+    client.download_dataset("VIN1", "id", "file.zip")
+    assert captured["headers"] == {"filename": "file.zip", "type": "partial"}
