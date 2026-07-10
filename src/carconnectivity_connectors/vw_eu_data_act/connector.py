@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import json
 import logging
 import netrc
 import os
@@ -410,6 +411,8 @@ class Connector(BaseConnector):
         self._bootstrapped: set[str] = set()
         # Merged dataset per VIN tracking the latest value per field across all downloaded zips.
         self._merged_datasets: Dict[str, Dataset] = {}
+        # VINs whose on-demand ('all') historical recon dump has already been written.
+        self._historical_done: "set[str]" = set()
         # Set of field names already observed per VIN (used to detect new/unmapped sensors).
         self._observed_fields: Dict[str, set] = {}
 
@@ -471,6 +474,16 @@ class Connector(BaseConnector):
 
         # Optional explicit VIN allow-list (otherwise all consented vehicles are used).
         self.active_config['vin'] = config.get('vin')
+
+        # --- on-demand ('all') historical recon (opt-in, off by default) ---
+        # When enabled, the connector fetches the on-demand historical export once
+        # per VIN and writes the raw JSON to historical_dump_path for offline
+        # inspection (it carries data points the continuous feed omits, notably
+        # ParkingPosition lat/lon). No mapping is done yet; this only captures the
+        # real envelope so the mapping can be written against it.
+        self.active_config['historical'] = bool(config.get('historical', False))
+        self.active_config['historical_dump_path'] = config.get(
+            'historical_dump_path', 'vw_eu_data_act.historical-sample.json')
 
         self.client: EudaApiClient = EudaApiClient(
             email=self.active_config['username'], password=self.active_config['password'],
@@ -708,7 +721,44 @@ class Connector(BaseConnector):
             dataset = Dataset.from_json(payload)
             self._map_dataset(vin, dataset)
             self._last_dataset[vin] = newest['name']
+        self._historical_recon(vin)
         return newest_created
+
+    def _historical_recon(self, vin: str) -> None:
+        """Opt-in one-shot capture of the on-demand ('all') historical export.
+
+        Fetches the historical package (same endpoints, request_type='all') and
+        writes the raw JSON to ``historical_dump_path`` so the envelope can be
+        inspected offline and the ParkingPosition mapping written against real
+        data. No mapping is done here. Robust to the export not being generated
+        yet (empty list / 404 / missing identifier -> debug log, no raise), so it
+        simply retries on a later cycle until the file appears.
+        """
+        if not self.active_config.get('historical') or vin in self._historical_done:
+            return
+        try:
+            meta = self.client.get_metadata(vin, request_type='all')
+            identifier = (meta or {}).get('Identifier') or (meta or {}).get('identifier')
+            if not identifier:
+                LOG.debug('Historical recon %s: no identifier yet (export not generated?)', vin)
+                return
+            listing = self.client.list_datasets(vin, identifier, request_type='all')
+            content = [e for e in listing if isinstance(e, dict) and e.get('name')
+                       and not e['name'].endswith(NO_CONTENT_SUFFIX)]
+            if not content:
+                LOG.debug('Historical recon %s: no on-demand dataset available yet', vin)
+                return
+            newest = content[-1]['name']
+            payload = self.client.download_dataset(vin, identifier, newest, request_type='all')
+            path = self.active_config['historical_dump_path']
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+            self._historical_done.add(vin)
+            LOG.info('Historical recon %s: wrote on-demand dataset to %s (%d data points). '
+                     'Inspect/redact it, then it can drive the ParkingPosition mapping.',
+                     vin, os.path.abspath(path), len(payload.get('Data', []) if isinstance(payload, dict) else []))
+        except (ApiError, RetrievalError, OSError, ValueError) as err:
+            LOG.debug('Historical recon %s failed (will retry next cycle): %s', vin, err)
 
     def _bootstrap_vehicle(self, vin: str, identifier: str, listing: list) -> None:
         """Download all available ZIP datasets for ``vin``, merge chronologically,
