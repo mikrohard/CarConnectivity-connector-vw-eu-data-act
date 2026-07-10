@@ -193,6 +193,9 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'plug_state',
     'external_power_supply_state',
     'remaining_charging_time',
+    'charging_power',
+    'actual_charge_rate',
+    'charge_rate_unit',
     'long_term_data_average_electr_engine_consumption',
     # Combustion / PHEV (mapped in _map_combustion).
     'fuel_level_current_level',
@@ -1015,6 +1018,22 @@ class Connector(BaseConnector):
             except ValueError:
                 type_enum = Charging.ChargingType.UNKNOWN
             vehicle.charging.type._set_value(type_enum, measured=captured_at)  # pylint: disable=protected-access
+
+        # Flat-format charge power: a deci-kW integer (e.g. 99 -> 9.9 kW on
+        # Passat/Tayron/Golf PHEV). Mapped only when the dotted
+        # battery_state_report.charge_power (already scaled kW) is absent, so the
+        # dotted behaviour is untouched.
+        flat_power = dataset.value_of('charging_power')
+        if isinstance(flat_power, (int, float)) and power is None:
+            vehicle.charging.power._set_value(value=flat_power / 10, measured=captured_at, unit=Power.KW)  # pylint: disable=protected-access
+
+        # Flat-format charge rate: same deci scaling; the unit comes from the flat
+        # charge_rate_unit companion (km/mi, per-h/min), normalised to a per-hour
+        # speed. Mapped only when the dotted battery_state_report.charge_rate is absent.
+        flat_rate = dataset.value_of('actual_charge_rate')
+        if isinstance(flat_rate, (int, float)) and charge_rate is None:
+            rate_value, rate_unit = _charge_rate_per_hour(flat_rate / 10, dataset.value_of('charge_rate_unit'))
+            vehicle.charging.rate._set_value(value=rate_value, measured=captured_at, unit=rate_unit)  # pylint: disable=protected-access
 
         plug = dataset.value_of('plug_state')
         if isinstance(plug, str):
