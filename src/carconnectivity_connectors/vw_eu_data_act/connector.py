@@ -475,12 +475,16 @@ class Connector(BaseConnector):
         # Optional explicit VIN allow-list (otherwise all consented vehicles are used).
         self.active_config['vin'] = config.get('vin')
 
-        # --- on-demand ('all') historical recon (opt-in, off by default) ---
+        # --- on-demand ('all') historical export dump (opt-in diagnostic, off by default) ---
         # When enabled, the connector fetches the on-demand historical export once
-        # per VIN and writes the raw JSON to historical_dump_path for offline
-        # inspection (it carries data points the continuous feed omits, notably
-        # ParkingPosition lat/lon). No mapping is done yet; this only captures the
-        # real envelope so the mapping can be written against it.
+        # per VIN and writes the raw JSON to historical_dump_path for inspection.
+        # No mapping is done: this is a diagnostic only. NOTE (verified on a real
+        # VW-group export): the 'all' package is the raw backend account dump
+        # (charger/timer/climater settings, remote lock-action history, trip
+        # mileage history, sync metadata; domains RBC/RDT/RPC/RLU/PSO/RTS/OTV). It
+        # does NOT contain a live sensor feed and, in particular, NO location /
+        # ParkingPosition. So there is no GPS to map here, matching the module
+        # docstring; the dump is kept to document what 'all' actually returns.
         self.active_config['historical'] = bool(config.get('historical', False))
         self.active_config['historical_dump_path'] = config.get(
             'historical_dump_path', 'vw_eu_data_act.historical-sample.json')
@@ -725,14 +729,16 @@ class Connector(BaseConnector):
         return newest_created
 
     def _historical_recon(self, vin: str) -> None:
-        """Opt-in one-shot capture of the on-demand ('all') historical export.
+        """Opt-in one-shot diagnostic dump of the on-demand ('all') historical export.
 
         Fetches the historical package (same endpoints, request_type='all') and
-        writes the raw JSON to ``historical_dump_path`` so the envelope can be
-        inspected offline and the ParkingPosition mapping written against real
-        data. No mapping is done here. Robust to the export not being generated
-        yet (empty list / 404 / missing identifier -> debug log, no raise), so it
-        simply retries on a later cycle until the file appears.
+        writes the raw JSON to ``historical_dump_path`` so it can be inspected. No
+        mapping is done: a real VW-group export was found to be the raw backend
+        account dump (settings/timers/lock-action + trip-mileage history), with no
+        live sensor feed and no location, so there is nothing to map onto native
+        attributes. Kept purely to document what 'all' returns. Robust to the
+        export not being generated yet (empty list / 404 / missing identifier ->
+        debug log, no raise), so it simply retries on a later cycle.
         """
         if not self.active_config.get('historical') or vin in self._historical_done:
             return
@@ -754,8 +760,7 @@ class Connector(BaseConnector):
             with open(path, 'w', encoding='utf-8') as handle:
                 json.dump(payload, handle, indent=2, ensure_ascii=False)
             self._historical_done.add(vin)
-            LOG.info('Historical recon %s: wrote on-demand dataset to %s (%d data points). '
-                     'Inspect/redact it, then it can drive the ParkingPosition mapping.',
+            LOG.info('Historical on-demand export for %s written to %s (%d data points) for inspection.',
                      vin, os.path.abspath(path), len(payload.get('Data', []) if isinstance(payload, dict) else []))
         except (ApiError, RetrievalError, OSError, ValueError) as err:
             LOG.debug('Historical recon %s failed (will retry next cycle): %s', vin, err)
