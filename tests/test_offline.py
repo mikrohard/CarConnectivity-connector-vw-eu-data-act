@@ -727,3 +727,50 @@ def test_flat_data_egolf_payload_promotes_and_maps(connector):
     assert drive.level.value == 26
     assert drive.range.value == 67
     assert drive.range.unit == Length.KM
+
+
+def test_freshest_max_value_prefers_highest_equal_freshness():
+    """Two equally-fresh mileage slots: by_field takes the stable smallest-UUID
+    (which can be the lower reading); freshest_max_value_of prefers the highest."""
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70876", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+            {"key": "bbbbbbbb-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70908", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        ]
+    })
+    assert ds.by_field("mileage.value").value == 70876          # arbitrary stable choice
+    assert ds.freshest_max_value_of("mileage.value") == 70908   # highest slot wins
+
+
+def test_freshest_max_value_single_and_absent():
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [{"key": "k1", "dataFieldName": "mileage.value", "value": "12345"}],
+    })
+    assert ds.freshest_max_value_of("mileage.value") == 12345
+    assert ds.freshest_max_value_of("does.not.exist") is None
+
+
+def test_odometer_prefers_highest_slot(connector):
+    """The mapped odometer never reads low when a dataset carries several
+    equally-fresh mileage slots."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70876", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+            {"key": "bbbbbbbb-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70908", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).odometer.value == 70908

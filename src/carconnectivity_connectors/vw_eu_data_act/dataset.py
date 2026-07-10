@@ -316,6 +316,33 @@ class Dataset:
         dp = self.by_field(field_name)
         return dp.value if dp is not None else None
 
+    def freshest_max_value_of(self, field_name: str):
+        """Like :meth:`value_of`, but among equally-fresh slots prefer the highest
+        numeric value.
+
+        A single dataset can carry several snapshots of one field under different
+        UUIDs that share one freshness (e.g. two ``mileage.value`` readings lagging
+        each other at the same ``car_captured_time``). The arbitrary smallest-UUID
+        tie-break in :meth:`by_field` can then pick the lower reading, making a
+        monotonic field like the odometer momentarily read low. Used for the
+        odometer; ``by_field``/``value_of`` keep their stable behaviour elsewhere.
+        """
+        matches = [dp for dp in self.points.values() if dp.field_name == field_name]
+        if not matches:
+            return None
+
+        def _rank(dp: "DataPoint"):  # freshness rank without the UUID tie-break
+            return (0, -dp.timestamp.timestamp()) if dp.timestamp is not None else (1, 0.0)
+
+        best_rank = min(_rank(dp) for dp in matches)
+        freshest = [dp for dp in matches if _rank(dp) == best_rank]
+        numeric = [dp.value for dp in freshest
+                   if isinstance(dp.value, (int, float)) and not isinstance(dp.value, bool)]
+        if numeric:
+            return max(numeric)
+        # Non-numeric field: keep the stable by_field choice among the freshest.
+        return min(freshest, key=_freshness_key).value
+
     @property
     def field_names(self) -> set:
         return {dp.field_name for dp in self.points.values()}
