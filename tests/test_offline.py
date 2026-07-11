@@ -920,3 +920,84 @@ def test_dotted_charge_power_takes_precedence_over_flat(connector):
     connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
 
     assert garage.get_vehicle(VIN).charging.power.value == 7.4   # dotted wins, no /10
+
+
+def test_freshest_numeric_by_prefix_skips_enum_companion():
+    """The prefix lookup returns the numeric physicalValue and skips the
+    companion value_type enum; unknown prefixes return None."""
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "energy_contents.maximal_energy_content.value_type",
+             "value": "SOME_ENUM"},
+            {"key": "k2", "dataFieldName": "energy_contents.maximal_energy_content.physicalValue",
+             "value": "128"},
+        ]
+    })
+    assert ds.freshest_numeric_by_prefix("energy_contents.maximal_energy_content") == 128
+    assert ds.freshest_numeric_by_prefix("energy_contents.current_energy_content") is None
+
+
+def test_battery_available_capacity_mapping(connector):
+    """maximal_energy_content maps to battery.available_capacity in kWh (value/10)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+            {"key": "k2", "dataFieldName": "energy_contents.maximal_energy_content.physicalValue",
+             "value": "128"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_electric_drive()
+    assert drive is not None
+    assert drive.battery.available_capacity.value == 12.8  # 128 / 10 kWh
+
+
+def test_request_type_threads_through_client(monkeypatch):
+    """client request_type defaults to 'partial' (unchanged behaviour) and, when
+    set to 'all', changes both the metadata path segment and the type header."""
+    from carconnectivity_connectors.vw_eu_data_act.client import EudaApiClient
+    client = EudaApiClient("user@example.com", "secret")
+    monkeypatch.setattr(client, "ensure_login", lambda: None)
+
+    seen = {}
+
+    def fake_get_json(url, *, headers=None, _retry=True):
+        seen["url"] = url
+        seen["headers"] = headers
+        return {"Identifier": "id"} if "metadata" in url else []
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+
+    client.get_metadata("VIN1")
+    assert seen["url"].endswith("/metadata/partial")
+    client.get_metadata("VIN1", "all")
+    assert seen["url"].endswith("/metadata/all")
+
+    client.list_datasets("VIN1", "id", "all")
+    assert seen["headers"] == {"type": "all"}
+    client.list_datasets("VIN1", "id")
+    assert seen["headers"] == {"type": "partial"}
+
+    captured = {}
+
+    class _FakeResp:
+        status_code = 200
+        content = b""
+
+    def fake_session_get(url, *, headers=None):
+        captured["headers"] = headers
+        return _FakeResp()
+    monkeypatch.setattr(client, "_session_get", fake_session_get)
+    monkeypatch.setattr(client, "_unzip_json", lambda content, name: {})
+
+    client.download_dataset("VIN1", "id", "file.zip", "all")
+    assert captured["headers"] == {"filename": "file.zip", "type": "all"}
+    client.download_dataset("VIN1", "id", "file.zip")
+    assert captured["headers"] == {"filename": "file.zip", "type": "partial"}
