@@ -877,3 +877,46 @@ def test_charge_mode_absent_leaves_attribute_unset(connector):
 
     v = garage.get_vehicle(VIN)
     assert getattr(v.charging.settings, "charge_mode", None) is None
+
+
+def test_flat_charge_power_and_rate_deci_scaling(connector):
+    """Flat-format charge power/rate are deci integers (99 -> 9.9)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+            {"key": "k2", "dataFieldName": "charging_power", "value": "99"},
+            {"key": "k3", "dataFieldName": "actual_charge_rate", "value": "99"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.power.value == 9.9   # 99 / 10 kW
+    assert v.charging.rate.value == 9.9    # 99 / 10 (km/h default)
+
+
+def test_dotted_charge_power_takes_precedence_over_flat(connector):
+    """The dotted battery_state_report.charge_power is already kW: when present,
+    the flat deci-kW field must be ignored (no mis-scaling)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+            {"key": "k2", "dataFieldName": "battery_state_report.charge_power", "value": "7.4"},
+            {"key": "k3", "dataFieldName": "charging_power", "value": "99"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).charging.power.value == 7.4   # dotted wins, no /10
