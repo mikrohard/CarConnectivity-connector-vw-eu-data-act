@@ -22,7 +22,10 @@ import requests
 from carconnectivity.units import Length, Speed
 
 from carconnectivity_connectors.vw_eu_data_act.client import ApiError, EudaApiClient
-from carconnectivity_connectors.vw_eu_data_act.connector import Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS
+from carconnectivity_connectors.vw_eu_data_act.connector import (
+    Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS,
+    _charge_mode, _charge_mode_flat, VWEudaChargeMode,
+)
 from carconnectivity_connectors.vw_eu_data_act.dataset import Dataset
 from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
 
@@ -686,3 +689,191 @@ def test_flat_data_egolf_payload_promotes_and_maps(connector):
     assert drive.level.value == 26
     assert drive.range.value == 67
     assert drive.range.unit == Length.KM
+
+
+def test_phev_promotes_to_hybrid_and_maps_both_drives(connector):
+    """A dataset with both battery and fuel fields -> HybridVehicle with two drives."""
+    from carconnectivity.vehicle import HybridVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "state_of_charge", "value": "25"},
+        {"key": "b", "dataFieldName": "cruising_range_secondary_engine", "value": "11"},
+        {"key": "c", "dataFieldName": "long_term_data_average_electr_engine_consumption", "value": "160"},
+        {"key": "d", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "e", "dataFieldName": "cruising_range_primary_engine", "value": "210"},
+        {"key": "f", "dataFieldName": "long_term_data_average_fuel_consumption", "value": "14"},
+    ]})
+    connector._map_dataset(VIN, ds)
+    v = garage.get_vehicle(VIN)
+    assert isinstance(v, HybridVehicle)
+    electric = v.get_electric_drive()
+    combustion = v.get_combustion_drive()
+    assert electric.level.value == 25 and electric.range.value == 11
+    assert electric.consumption.value == 16.0   # 160 kWh/1000km -> 16.0 kWh/100km
+    assert combustion.level.value == 37 and combustion.range.value == 210
+    assert combustion.consumption.value == 1.4   # 14 L/1000km -> 1.4 L/100km
+
+
+def test_pure_ev_stays_electric_not_hybrid(connector):
+    """A battery-only dataset stays a pure electric vehicle (no combustion drive)."""
+    from carconnectivity.vehicle import CombustionVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "battery_state_report.soc", "value": "69"},
+        {"key": "b", "dataFieldName": "range", "value": "312"},
+    ]})
+    connector._map_dataset(VIN, ds)
+    v = garage.get_vehicle(VIN)
+    assert not isinstance(v, CombustionVehicle)
+    assert v.get_electric_drive().level.value == 69
+
+
+def test_diesel_creates_dieseldrive_and_maps_adblue(connector):
+    """A diesel dataset (numeric scr_range) must create a DieselDrive, because
+    adblue_range exists only there. Writing it on a plain CombustionDrive (the
+    previous behaviour) raised AttributeError on real diesels."""
+    from carconnectivity.drive import DieselDrive
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "60"},
+        {"key": "b", "dataFieldName": "cruising_range_primary_engine", "value": "700"},
+        {"key": "c", "dataFieldName": "scr_range", "value": "9000"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_combustion_drive()
+    assert isinstance(drive, DieselDrive)
+    assert str(drive.type.value) == "Type.DIESEL"
+    assert drive.adblue_range.value == 9000
+    assert drive.adblue_range.unit == Length.KM
+
+
+def test_petrol_empty_scr_range_stays_combustion_no_crash(connector):
+    """Petrol/PHEV cars also carry the scr_range field but report it as an empty
+    string. That must NOT be read as diesel (no DieselDrive) and must not raise."""
+    from carconnectivity.drive import CombustionDrive, DieselDrive
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "b", "dataFieldName": "cruising_range_primary_engine", "value": "210"},
+        {"key": "c", "dataFieldName": "scr_range", "value": ""},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_combustion_drive()
+    assert isinstance(drive, CombustionDrive)
+    assert not isinstance(drive, DieselDrive)
+    assert str(drive.type.value) == "Type.GASOLINE"
+
+
+PHEV_SAMPLE = os.path.join(os.path.dirname(__file__), "phev_sample_dataset.json")
+
+
+def test_phev_real_world_sample(connector):
+    """Full mapping against an anonymised real flat SEAT Leon PHEV dataset."""
+    from carconnectivity.vehicle import HybridVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    payload = json.load(open(PHEV_SAMPLE, "r", encoding="utf-8"))
+    payload["vin"] = VIN
+    connector._map_dataset(VIN, Dataset.from_json(payload))
+    v = garage.get_vehicle(VIN)
+
+    assert isinstance(v, HybridVehicle)
+    # primary slot = petrol (combustion), secondary = electric (seatcupra convention)
+    primary = v.drives.drives["primary"]
+    secondary = v.drives.drives["secondary"]
+    assert str(primary.type.value) == "Type.GASOLINE"
+    assert str(secondary.type.value) == "Type.ELECTRIC"
+    assert primary.range.value == 210 and primary.level.value == 37        # petrol
+    assert secondary.range.value == 11 and secondary.level.value == 25     # electric
+    assert primary.consumption.value == 1.4                               # L/100km
+    assert secondary.consumption.value == 16.0                            # kWh/100km
+    # vehicle-level
+    assert v.odometer.value == 40208
+    assert v.outside_temperature.value == 39.0
+    # status objects populated
+    assert len(v.doors.doors) == 6
+    assert v.doors.doors["front_right"].open_state.value.value == "open"
+    assert len(v.windows.windows) == 5
+    assert v.lights.lights["parking"].light_state.value.value == "off"
+    # maintenance distance preserved
+    assert v.maintenance.inspection_due_after.value == 23500
+
+
+def test_charge_mode_normalisation():
+    """_charge_mode maps the data-dictionary tokens (with or without the
+    CHARGE_MODE_SELECTION_ prefix) to the enum, None stays None, unknown -> UNKNOWN."""
+    assert _charge_mode(None) is None
+    assert _charge_mode("") is None
+    assert _charge_mode("CHARGE_MODE_SELECTION_TIMERCHARGING") == VWEudaChargeMode.TIMER
+    assert _charge_mode("CHARGE_MODE_SELECTION_TIMER_CHARGING_CLIMATIZATION") \
+        == VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION
+    assert _charge_mode("CHARGE_MODE_SELECTION_PREFERRED_CHARGING_TIMES") \
+        == VWEudaChargeMode.PREFERRED_CHARGING_TIMES
+    assert _charge_mode("manual") == VWEudaChargeMode.MANUAL
+    assert _charge_mode("timer") == VWEudaChargeMode.TIMER
+    assert _charge_mode("something_new") == VWEudaChargeMode.UNKNOWN
+
+
+def test_charge_mode_dotted_mapping(connector):
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "settings.charge_mode_selection",
+             "value": "CHARGE_MODE_SELECTION_PREFERRED_CHARGING_TIMES"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.settings.charge_mode.value == VWEudaChargeMode.PREFERRED_CHARGING_TIMES
+
+
+def test_charge_mode_flat_options_mapping(connector):
+    """Flat/continuous format: the active per-option boolean wins."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "charge_mode_selection_options.manual", "value": "false"},
+            {"key": "k2", "dataFieldName": "charge_mode_selection_options.timer_charging", "value": "true"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.settings.charge_mode.value == VWEudaChargeMode.TIMER
+
+
+def test_charge_mode_absent_leaves_attribute_unset(connector):
+    """A vehicle that does not report the field gets no charge_mode attribute
+    (no regression on brands/platforms without it, e.g. many VWs)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "mileage.value", "value": "100"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert getattr(v.charging.settings, "charge_mode", None) is None
