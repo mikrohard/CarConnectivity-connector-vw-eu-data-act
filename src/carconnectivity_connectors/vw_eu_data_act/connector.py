@@ -866,8 +866,10 @@ class Connector(BaseConnector):
 
         # Odometer (mileage.value). The portal reports km or miles depending on
         # the vehicle; the unit comes from the companion mileage.unit enum, with
-        # km as the fallback when that field is absent.
-        mileage = dataset.value_of('mileage.value')
+        # km as the fallback when that field is absent. Prefer the highest slot
+        # among equally-fresh readings so a lagging snapshot never makes the
+        # (monotonic) odometer momentarily read low.
+        mileage = dataset.freshest_max_value_of('mileage.value')
         if mileage is not None:
             mileage_unit = Length.MI if resolve_distance_unit(dataset.value_of('mileage.unit')) == 'mi' else Length.KM
             vehicle.odometer._set_value(value=mileage, measured=captured_at, unit=mileage_unit)  # pylint: disable=protected-access
@@ -960,7 +962,7 @@ class Connector(BaseConnector):
                 drive.range.precision = 1
 
             # Some flat-format datasets only provide a bare 'mileage' field.
-            flat_mileage = dataset.value_of('mileage')
+            flat_mileage = dataset.freshest_max_value_of('mileage')
             if flat_mileage is not None and mileage is None:
                 vehicle.odometer._set_value(value=flat_mileage, measured=captured_at, unit=Length.KM)  # pylint: disable=protected-access
                 vehicle.odometer.precision = 1

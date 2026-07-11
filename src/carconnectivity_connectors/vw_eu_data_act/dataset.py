@@ -216,6 +216,7 @@ class DataPoint:
     key: str
     field_name: str
     raw_value: str
+    timestamp: Optional[datetime] = None  # the field's own timestampUtc (when the car reported it)
 
     @property
     def value(self):
@@ -226,6 +227,30 @@ class DataPoint:
         mapping (which keys off the label string) keeps working.
         """
         return resolve_enum_index(self.field_name, parse_value(self.raw_value))
+
+
+def _freshness_key(dp: "DataPoint"):
+    """Sort key for ``min()`` that picks the freshest data point.
+
+    Orders timestamped points ahead of timestamp-less ones, newest first, with
+    the smallest UUID as a stable tie-break (so selection never flip-flops when
+    the portal reshuffles the array or two readings share a timestamp).
+    """
+    if dp.timestamp is not None:
+        return (0, -dp.timestamp.timestamp(), dp.key)
+    return (1, 0.0, dp.key)
+
+
+def _at_least_as_fresh(new: "DataPoint", cur: "DataPoint") -> bool:
+    """Whether ``new`` should replace ``cur`` while merging datasets in list order.
+
+    A timestamped reading wins over an older or timestamp-less one; on equal
+    timestamps (or when both lack one) the later dataset in list order wins,
+    preserving the previous behaviour for fields that carry no ``timestampUtc``.
+    """
+    if new.timestamp is not None:
+        return cur.timestamp is None or new.timestamp >= cur.timestamp
+    return cur.timestamp is None
 
 
 @dataclass
@@ -247,7 +272,8 @@ class Dataset:
             if not key:
                 continue
             field_name = item.get("dataFieldName") or key
-            dp = DataPoint(key=key, field_name=field_name, raw_value=item.get("value", ""))
+            dp = DataPoint(key=key, field_name=field_name, raw_value=item.get("value", ""),
+                           timestamp=parse_timestamp(item.get("timestampUtc")))
             points[key] = dp
             if field_name == "car_captured_time":
                 ts = parse_timestamp(dp.raw_value)
@@ -271,7 +297,10 @@ class Dataset:
         for ds in datasets:
             for field_name in ds.field_names:
                 dp = ds.by_field(field_name)
-                if dp is not None:
+                if dp is None:
+                    continue
+                cur = latest.get(field_name)
+                if cur is None or _at_least_as_fresh(dp, cur):
                     latest[field_name] = dp
             if ds.captured_at and (merged_captured is None or ds.captured_at > merged_captured):
                 merged_captured = ds.captured_at
@@ -286,13 +315,15 @@ class Dataset:
         The portal merges several report snapshots into one flat array with no
         ordering guarantee and no way to tell which value is "live", so a field
         like ``charging_state_report.current_charge_state`` can appear several
-        times under different UUIDs with conflicting values. We pick the entry
-        with the smallest ``key`` (UUID): an arbitrary but *stable* choice, so a
-        mapped attribute consistently tracks the same data point across refreshes
-        instead of flip-flopping when the portal reshuffles the array.
+        times under different UUIDs with conflicting values. We pick the
+        **freshest** reading (latest ``timestampUtc``); when timestamps are equal
+        or absent we fall back to the smallest ``key`` (UUID): an arbitrary but
+        *stable* choice, so a mapped attribute consistently tracks the same data
+        point across refreshes instead of flip-flopping when the portal reshuffles
+        the array.
         """
         matches = [dp for dp in self.points.values() if dp.field_name == field_name]
-        return min(matches, key=lambda dp: dp.key) if matches else None
+        return min(matches, key=_freshness_key) if matches else None
 
     def value_of(self, field_name: str):
         """Return the typed value of ``field_name`` or ``None`` if absent."""
@@ -313,6 +344,32 @@ class Dataset:
                    and isinstance(dp.value, (int, float)) and not isinstance(dp.value, bool)]
         return min(matches, key=lambda dp: dp.key).value if matches else None
 
+    def freshest_max_value_of(self, field_name: str):
+        """Like :meth:`value_of`, but among equally-fresh slots prefer the highest
+        numeric value.
+
+        A single dataset can carry several snapshots of one field under different
+        UUIDs that share one freshness (e.g. two ``mileage.value`` readings lagging
+        each other at the same ``car_captured_time``). The arbitrary smallest-UUID
+        tie-break in :meth:`by_field` can then pick the lower reading, making a
+        monotonic field like the odometer momentarily read low. Used for the
+        odometer; ``by_field``/``value_of`` keep their stable behaviour elsewhere.
+        """
+        matches = [dp for dp in self.points.values() if dp.field_name == field_name]
+        if not matches:
+            return None
+
+        def _rank(dp: "DataPoint"):  # freshness rank without the UUID tie-break
+            return (0, -dp.timestamp.timestamp()) if dp.timestamp is not None else (1, 0.0)
+
+        best_rank = min(_rank(dp) for dp in matches)
+        freshest = [dp for dp in matches if _rank(dp) == best_rank]
+        numeric = [dp.value for dp in freshest
+                   if isinstance(dp.value, (int, float)) and not isinstance(dp.value, bool)]
+        if numeric:
+            return max(numeric)
+        # Non-numeric field: keep the stable by_field choice among the freshest.
+        return min(freshest, key=_freshness_key).value
 
     @property
     def field_names(self) -> set:

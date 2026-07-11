@@ -1001,3 +1001,91 @@ def test_request_type_threads_through_client(monkeypatch):
     assert captured["headers"] == {"filename": "file.zip", "type": "all"}
     client.download_dataset("VIN1", "id", "file.zip")
     assert captured["headers"] == {"filename": "file.zip", "type": "partial"}
+
+
+def test_by_field_prefers_freshest_timestamp():
+    """When a field appears several times, the reading with the latest
+    timestampUtc wins, even if a staler reading has a smaller UUID (which the
+    old smallest-UUID rule would have picked)."""
+    data = [
+        {"key": "aaaa", "dataFieldName": "oil_level_actual_level",
+         "value": "100.0", "timestampUtc": "2026-06-23T15:14:12.000Z"},
+        {"key": "zzzz", "dataFieldName": "oil_level_actual_level",
+         "value": "87.5", "timestampUtc": "2026-06-25T10:37:14.000Z"},
+    ]
+    assert Dataset.from_json({"vin": VIN, "Data": data}).value_of("oil_level_actual_level") == 87.5
+
+
+def test_merge_prefers_freshest_timestamp_regardless_of_list_order():
+    """A stale reading in a later-listed dataset must not override a fresher one.
+    Reproduces the oil-level bug: oil 100.0 measured 2026-06-23 must lose to oil
+    87.5 measured 2026-06-25 whatever the merge order."""
+    fresh = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k1", "dataFieldName": "oil_level_actual_level",
+         "value": "87.5", "timestampUtc": "2026-06-25T10:37:14.000Z"},
+    ]})
+    stale = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k2", "dataFieldName": "oil_level_actual_level",
+         "value": "100.0", "timestampUtc": "2026-06-23T15:14:12.000Z"},
+    ]})
+    assert Dataset.merge([fresh, stale]).value_of("oil_level_actual_level") == 87.5
+    assert Dataset.merge([stale, fresh]).value_of("oil_level_actual_level") == 87.5
+
+
+def test_merge_timestampless_field_keeps_list_order():
+    """Fields without timestampUtc keep the previous behaviour: the later dataset
+    in list order wins (no regression for timestamp-less fields)."""
+    first = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k1", "dataFieldName": "charging_state", "value": "off"},
+    ]})
+    second = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k2", "dataFieldName": "charging_state", "value": "charging"},
+    ]})
+    assert Dataset.merge([first, second]).value_of("charging_state") == "charging"
+
+
+def test_freshest_max_value_prefers_highest_equal_freshness():
+    """Two equally-fresh mileage slots: by_field takes the stable smallest-UUID
+    (which can be the lower reading); freshest_max_value_of prefers the highest."""
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70876", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+            {"key": "bbbbbbbb-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70908", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        ]
+    })
+    assert ds.by_field("mileage.value").value == 70876          # arbitrary stable choice
+    assert ds.freshest_max_value_of("mileage.value") == 70908   # highest slot wins
+
+
+def test_freshest_max_value_single_and_absent():
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [{"key": "k1", "dataFieldName": "mileage.value", "value": "12345"}],
+    })
+    assert ds.freshest_max_value_of("mileage.value") == 12345
+    assert ds.freshest_max_value_of("does.not.exist") is None
+
+
+def test_odometer_prefers_highest_slot(connector):
+    """The mapped odometer never reads low when a dataset carries several
+    equally-fresh mileage slots."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70876", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+            {"key": "bbbbbbbb-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70908", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).odometer.value == 70908
