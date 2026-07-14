@@ -12,16 +12,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import json
 import logging
 import netrc
 import os
 import threading
 import traceback
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
-from carconnectivity.units import EnergyConsumption, FuelConsumption, Length, Power, Speed, Temperature
+from carconnectivity.units import Energy, EnergyConsumption, FuelConsumption, Length, Power, Speed, Temperature
 from carconnectivity.attributes import DateAttribute, DurationAttribute, EnumAttribute
 from carconnectivity.vehicle import GenericVehicle, ElectricVehicle, CombustionVehicle
 from carconnectivity.drive import CombustionDrive, DieselDrive, ElectricDrive, GenericDrive
@@ -164,6 +166,7 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'charging_state_report.current_charge_state',
     'charging_state_report.charge_type',
     'settings.target_soc',
+    'settings.charge_mode_selection',
     'car_captured_time',
     # Flat-format (eGolf) fields handled in _map_dataset.
     'mileage',
@@ -180,9 +183,20 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     # Flat-format charging + consumption (mapped in _map_electric).
     'charging_state',
     'charging_mode',
+    'charge_mode_selection_options.manual',
+    'charge_mode_selection_options.timer_charging',
+    'charge_mode_selection_options.timer_charging_climatization',
+    'charge_mode_selection_options.preferred_charging_times',
+    'charge_mode_selection_options.only_own_current',
+    'charge_mode_selection_options.home_storage_charging',
+    'charge_mode_selection_options.immediate_charging',
+    'charge_mode_selection_options.immediate_discharging',
     'plug_state',
     'external_power_supply_state',
     'remaining_charging_time',
+    'charging_power',
+    'actual_charge_rate',
+    'charge_rate_unit',
     'long_term_data_average_electr_engine_consumption',
     # Combustion / PHEV (mapped in _map_combustion).
     'fuel_level_current_level',
@@ -209,6 +223,13 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'position_rear_left_door_window_lifter', 'position_rear_right_door_window_lifter',
     'position_sunroof_motor_hood_1',
 }
+
+# Field-name prefixes whose subtree is mapped even though the exact leaf name is
+# not pinned (e.g. energy_contents.maximal_energy_content.<leaf>, mapped by
+# prefix). Excluded from the unmapped-sensor detection like KNOWN_MAPPED_FIELDS.
+KNOWN_MAPPED_PREFIXES: "Tuple[str, ...]" = (
+    'energy_contents.maximal_energy_content',
+)
 
 # Portal door id -> (open_state field, locked_state field). Note the double
 # underscore in the rear-left lock field (portal quirk).
@@ -274,6 +295,96 @@ def _lock_code(value) -> "Optional[str]":
     return None
 
 
+class VWEudaChargeMode(Enum):
+    """Selected charge mode reported by the portal (``charge_mode_selection``).
+
+    Read-only. The field is the *selected* charge mode (one of its values is
+    itself ``preferred_charging_times``), so the attribute is named ``charge_mode``
+    rather than "preferred". Member names/values follow the EU Data Act data
+    dictionary options and mirror the seatcupra/skoda connector enum, so consumers
+    see a consistent set across brands.
+    """
+    MANUAL = 'manual'
+    TIMER = 'timer'
+    TIMER_CHARGING_WITH_CLIMATISATION = 'timer_charging_with_climatisation'
+    PREFERRED_CHARGING_TIMES = 'preferred_charging_times'
+    ONLY_OWN_CURRENT = 'only_own_current'
+    HOME_STORAGE_CHARGING = 'home_storage_charging'
+    IMMEDIATE_CHARGING = 'immediate_charging'
+    IMMEDIATE_DISCHARGING = 'immediate_discharging'
+    OFF = 'off'
+    INVALID = 'invalid'
+    UNKNOWN = 'unknown charge mode'
+
+
+# Dotted format: a single 'settings.charge_mode_selection' value. Normalised token
+# (upper-case, optional CHARGE_MODE_SELECTION_ prefix stripped) -> enum.
+_CHARGE_MODE_TOKENS = {
+    'MANUAL': VWEudaChargeMode.MANUAL,
+    'TIMER': VWEudaChargeMode.TIMER,
+    'TIMERCHARGING': VWEudaChargeMode.TIMER,
+    'TIMER_CHARGING': VWEudaChargeMode.TIMER,
+    'IMMEDIATECHARGING': VWEudaChargeMode.IMMEDIATE_CHARGING,
+    'IMMEDIATE_CHARGING': VWEudaChargeMode.IMMEDIATE_CHARGING,
+    'TIMER_CHARGING_CLIMATIZATION': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'TIMER_CHARGING_CLIMATISATION': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'TIMER_CHARGING_WITH_CLIMATISATION': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'PREFERRED_CHARGING_TIMES': VWEudaChargeMode.PREFERRED_CHARGING_TIMES,
+    'ONLY_OWN_CURRENT': VWEudaChargeMode.ONLY_OWN_CURRENT,
+    'HOME_STORAGE_CHARGING': VWEudaChargeMode.HOME_STORAGE_CHARGING,
+    'IMMEDIATE_DISCHARGING': VWEudaChargeMode.IMMEDIATE_DISCHARGING,
+    'OFF': VWEudaChargeMode.OFF,
+    'INVALID': VWEudaChargeMode.INVALID,
+}
+
+# Flat/continuous format: one boolean per option
+# (charge_mode_selection_options.<suffix>); the active one wins.
+_CHARGE_MODE_FLAT = {
+    'manual': VWEudaChargeMode.MANUAL,
+    'timer_charging': VWEudaChargeMode.TIMER,
+    'timer_charging_climatization': VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION,
+    'preferred_charging_times': VWEudaChargeMode.PREFERRED_CHARGING_TIMES,
+    'only_own_current': VWEudaChargeMode.ONLY_OWN_CURRENT,
+    'home_storage_charging': VWEudaChargeMode.HOME_STORAGE_CHARGING,
+    'immediate_charging': VWEudaChargeMode.IMMEDIATE_CHARGING,
+    'immediate_discharging': VWEudaChargeMode.IMMEDIATE_DISCHARGING,
+}
+
+
+def _charge_mode(raw) -> "Optional[VWEudaChargeMode]":
+    """Normalise a dotted ``charge_mode_selection`` value to VWEudaChargeMode.
+
+    Returns None when there is nothing to map (absent/empty) and ``UNKNOWN`` when
+    a value is present but unrecognised, so a new value is surfaced rather than
+    silently dropped.
+    """
+    if raw is None:
+        return None
+    token = str(raw).strip().upper()
+    if not token:
+        return None
+    if token.startswith('CHARGE_MODE_SELECTION_'):
+        token = token[len('CHARGE_MODE_SELECTION_'):]
+    return _CHARGE_MODE_TOKENS.get(token, VWEudaChargeMode.UNKNOWN)
+
+
+def _charge_mode_flat(dataset) -> "Optional[VWEudaChargeMode]":
+    """Pick the active charge mode from the flat per-option booleans."""
+    for suffix, mode in _CHARGE_MODE_FLAT.items():
+        value = dataset.value_of(f'charge_mode_selection_options.{suffix}')
+        if value is None:
+            continue
+        if isinstance(value, bool):
+            active = value
+        elif isinstance(value, (int, float)):
+            active = value != 0
+        else:
+            active = str(value).strip().lower() in ('true', '1', 'yes', 'on')
+        if active:
+            return mode
+    return None
+
+
 def _light_code(value) -> "Optional[str]":
     """Decode the portal 'lights' encoding: 2 = off, 3/4/5 = on, 0/1 = invalid."""
     if value in (0, 1):
@@ -310,6 +421,8 @@ class Connector(BaseConnector):
         self._bootstrapped: set[str] = set()
         # Merged dataset per VIN tracking the latest value per field across all downloaded zips.
         self._merged_datasets: Dict[str, Dataset] = {}
+        # VINs whose on-demand ('all') historical recon dump has already been written.
+        self._historical_done: "set[str]" = set()
         # Set of field names already observed per VIN (used to detect new/unmapped sensors).
         self._observed_fields: Dict[str, set] = {}
 
@@ -371,6 +484,20 @@ class Connector(BaseConnector):
 
         # Optional explicit VIN allow-list (otherwise all consented vehicles are used).
         self.active_config['vin'] = config.get('vin')
+
+        # --- on-demand ('all') historical export dump (opt-in diagnostic, off by default) ---
+        # When enabled, the connector fetches the on-demand historical export once
+        # per VIN and writes the raw JSON to historical_dump_path for inspection.
+        # No mapping is done: this is a diagnostic only. NOTE (verified on a real
+        # VW-group export): the 'all' package is the raw backend account dump
+        # (charger/timer/climater settings, remote lock-action history, trip
+        # mileage history, sync metadata; domains RBC/RDT/RPC/RLU/PSO/RTS/OTV). It
+        # does NOT contain a live sensor feed and, in particular, NO location /
+        # ParkingPosition. So there is no GPS to map here, matching the module
+        # docstring; the dump is kept to document what 'all' actually returns.
+        self.active_config['historical'] = bool(config.get('historical', False))
+        self.active_config['historical_dump_path'] = config.get(
+            'historical_dump_path', 'vw_eu_data_act.historical-sample.json')
 
         self.client: EudaApiClient = EudaApiClient(
             email=self.active_config['username'], password=self.active_config['password'],
@@ -608,7 +735,45 @@ class Connector(BaseConnector):
             dataset = Dataset.from_json(payload)
             self._map_dataset(vin, dataset, _created_on(newest))
             self._last_dataset[vin] = newest['name']
+        self._historical_recon(vin)
         return newest_created
+
+    def _historical_recon(self, vin: str) -> None:
+        """Opt-in one-shot diagnostic dump of the on-demand ('all') historical export.
+
+        Fetches the historical package (same endpoints, request_type='all') and
+        writes the raw JSON to ``historical_dump_path`` so it can be inspected. No
+        mapping is done: a real VW-group export was found to be the raw backend
+        account dump (settings/timers/lock-action + trip-mileage history), with no
+        live sensor feed and no location, so there is nothing to map onto native
+        attributes. Kept purely to document what 'all' returns. Robust to the
+        export not being generated yet (empty list / 404 / missing identifier ->
+        debug log, no raise), so it simply retries on a later cycle.
+        """
+        if not self.active_config.get('historical') or vin in self._historical_done:
+            return
+        try:
+            meta = self.client.get_metadata(vin, request_type='all')
+            identifier = (meta or {}).get('Identifier') or (meta or {}).get('identifier')
+            if not identifier:
+                LOG.debug('Historical recon %s: no identifier yet (export not generated?)', vin)
+                return
+            listing = self.client.list_datasets(vin, identifier, request_type='all')
+            content = [e for e in listing if isinstance(e, dict) and e.get('name')
+                       and not e['name'].endswith(NO_CONTENT_SUFFIX)]
+            if not content:
+                LOG.debug('Historical recon %s: no on-demand dataset available yet', vin)
+                return
+            newest = content[-1]['name']
+            payload = self.client.download_dataset(vin, identifier, newest, request_type='all')
+            path = self.active_config['historical_dump_path']
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+            self._historical_done.add(vin)
+            LOG.info('Historical on-demand export for %s written to %s (%d data points) for inspection.',
+                     vin, os.path.abspath(path), len(payload.get('Data', []) if isinstance(payload, dict) else []))
+        except (ApiError, RetrievalError, OSError, ValueError) as err:
+            LOG.debug('Historical recon %s failed (will retry next cycle): %s', vin, err)
 
     def _bootstrap_vehicle(self, vin: str, identifier: str, listing: list) -> None:
         """Download all available ZIP datasets for ``vin``, merge chronologically,
@@ -640,7 +805,8 @@ class Connector(BaseConnector):
     @staticmethod
     def _detect_unmapped_fields(vin: str, dataset: Dataset) -> None:
         """Log any field names in the dataset that are not yet mapped to CarConnectivity."""
-        unmapped = dataset.field_names - KNOWN_MAPPED_FIELDS
+        unmapped = {f for f in dataset.field_names
+                    if f not in KNOWN_MAPPED_FIELDS and not f.startswith(KNOWN_MAPPED_PREFIXES)}
         for field in sorted(unmapped):
             dp = dataset.by_field(field)
             raw = dp.raw_value if dp else '?'
@@ -719,8 +885,10 @@ class Connector(BaseConnector):
 
         # Odometer (mileage.value). The portal reports km or miles depending on
         # the vehicle; the unit comes from the companion mileage.unit enum, with
-        # km as the fallback when that field is absent.
-        mileage = dataset.value_of('mileage.value')
+        # km as the fallback when that field is absent. Prefer the highest slot
+        # among equally-fresh readings so a lagging snapshot never makes the
+        # (monotonic) odometer momentarily read low.
+        mileage = dataset.freshest_max_value_of('mileage.value')
         if mileage is not None:
             mileage_unit = Length.MI if resolve_distance_unit(dataset.value_of('mileage.unit')) == 'mi' else Length.KM
             vehicle.odometer._set_value(value=mileage, measured=captured_at, unit=mileage_unit)  # pylint: disable=protected-access
@@ -813,7 +981,7 @@ class Connector(BaseConnector):
                 drive.range.precision = 1
 
             # Some flat-format datasets only provide a bare 'mileage' field.
-            flat_mileage = dataset.value_of('mileage')
+            flat_mileage = dataset.freshest_max_value_of('mileage')
             if flat_mileage is not None and mileage is None:
                 vehicle.odometer._set_value(value=flat_mileage, measured=captured_at, unit=Length.KM)  # pylint: disable=protected-access
                 vehicle.odometer.precision = 1
@@ -859,6 +1027,20 @@ class Connector(BaseConnector):
         if tmax is not None:
             battery.temperature_max._set_value(value=tmax, measured=captured_at, unit=Temperature.C)  # pylint: disable=protected-access
 
+        # Maximal (usable) battery energy content -> available_capacity (kWh).
+        # The portal reports energy_contents.maximal_energy_content.<leaf>: the
+        # dynamically measured usable capacity (degrades with battery age), the
+        # same concept the skoda connector fills from the static spec, so it backs
+        # a derivable state of health = available_capacity / total_capacity.
+        # Matched by prefix because the exact leaf is unconfirmed, which also skips
+        # the companion value_type enum. NOTE: the /10 scaling (deci-kWh) follows
+        # the request in issue #22 and is unverified against a real value. Absent
+        # on many vehicles (guarded).
+        max_energy = dataset.freshest_numeric_by_prefix('energy_contents.maximal_energy_content')
+        if isinstance(max_energy, (int, float)):
+            battery.available_capacity._set_value(  # pylint: disable=protected-access
+                value=max_energy / 10, measured=captured_at, unit=Energy.KWH)
+
         # Charging power (kW)
         power = dataset.value_of('battery_state_report.charge_power')
         if power is not None:
@@ -897,6 +1079,24 @@ class Connector(BaseConnector):
         if target_soc is not None:
             vehicle.charging.settings.target_level._set_value(value=target_soc, measured=captured_at)  # pylint: disable=protected-access
 
+        # Selected charge mode (charge_mode_selection). The dotted format carries a
+        # single value; the flat/continuous format splits it into one boolean per
+        # option, of which the active one is set. Neutral name `charge_mode`: the
+        # field is the *selected* mode (one value being `preferred_charging_times`),
+        # not necessarily a "preferred" one. Read-only, no commands here. The
+        # attribute is created lazily and tagged connector_custom (no core model).
+        charge_mode = _charge_mode(dataset.value_of('settings.charge_mode_selection'))
+        if charge_mode is None:
+            charge_mode = _charge_mode_flat(dataset)
+        if charge_mode is not None:
+            settings = vehicle.charging.settings
+            charge_mode_attr = getattr(settings, 'charge_mode', None)
+            if not isinstance(charge_mode_attr, EnumAttribute):
+                charge_mode_attr = EnumAttribute(name='charge_mode', parent=settings,
+                                                 value_type=VWEudaChargeMode, tags={'connector_custom'})
+                settings.charge_mode = charge_mode_attr
+            charge_mode_attr._set_value(charge_mode, measured=captured_at)  # pylint: disable=protected-access
+
         # --- Flat-format charging fields (eGolf / PHEV) ----------------------
         # Mirror the dotted battery_state_report.* / charging_state_report.* fields
         # above but use simple lower-case string enums; map them when the dotted
@@ -916,6 +1116,22 @@ class Connector(BaseConnector):
             except ValueError:
                 type_enum = Charging.ChargingType.UNKNOWN
             vehicle.charging.type._set_value(type_enum, measured=captured_at)  # pylint: disable=protected-access
+
+        # Flat-format charge power: a deci-kW integer (e.g. 99 -> 9.9 kW on
+        # Passat/Tayron/Golf PHEV). Mapped only when the dotted
+        # battery_state_report.charge_power (already scaled kW) is absent, so the
+        # dotted behaviour is untouched.
+        flat_power = dataset.value_of('charging_power')
+        if isinstance(flat_power, (int, float)) and power is None:
+            vehicle.charging.power._set_value(value=flat_power / 10, measured=captured_at, unit=Power.KW)  # pylint: disable=protected-access
+
+        # Flat-format charge rate: same deci scaling; the unit comes from the flat
+        # charge_rate_unit companion (km/mi, per-h/min), normalised to a per-hour
+        # speed. Mapped only when the dotted battery_state_report.charge_rate is absent.
+        flat_rate = dataset.value_of('actual_charge_rate')
+        if isinstance(flat_rate, (int, float)) and charge_rate is None:
+            rate_value, rate_unit = _charge_rate_per_hour(flat_rate / 10, dataset.value_of('charge_rate_unit'))
+            vehicle.charging.rate._set_value(value=rate_value, measured=captured_at, unit=rate_unit)  # pylint: disable=protected-access
 
         plug = dataset.value_of('plug_state')
         if isinstance(plug, str):

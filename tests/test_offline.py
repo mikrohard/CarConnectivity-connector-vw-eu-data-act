@@ -22,7 +22,10 @@ import requests
 from carconnectivity.units import Length, Speed
 
 from carconnectivity_connectors.vw_eu_data_act.client import ApiError, EudaApiClient
-from carconnectivity_connectors.vw_eu_data_act.connector import Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS
+from carconnectivity_connectors.vw_eu_data_act.connector import (
+    Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS,
+    _charge_mode, _charge_mode_flat, VWEudaChargeMode,
+)
 from carconnectivity_connectors.vw_eu_data_act.dataset import Dataset
 from carconnectivity_connectors.vw_eu_data_act.vehicle import VWEudaElectricVehicle, VWEudaVehicle
 
@@ -800,3 +803,289 @@ def test_phev_real_world_sample(connector):
     assert v.lights.lights["parking"].light_state.value.value == "off"
     # maintenance distance preserved
     assert v.maintenance.inspection_due_after.value == 23500
+
+
+def test_charge_mode_normalisation():
+    """_charge_mode maps the data-dictionary tokens (with or without the
+    CHARGE_MODE_SELECTION_ prefix) to the enum, None stays None, unknown -> UNKNOWN."""
+    assert _charge_mode(None) is None
+    assert _charge_mode("") is None
+    assert _charge_mode("CHARGE_MODE_SELECTION_TIMERCHARGING") == VWEudaChargeMode.TIMER
+    assert _charge_mode("CHARGE_MODE_SELECTION_TIMER_CHARGING_CLIMATIZATION") \
+        == VWEudaChargeMode.TIMER_CHARGING_WITH_CLIMATISATION
+    assert _charge_mode("CHARGE_MODE_SELECTION_PREFERRED_CHARGING_TIMES") \
+        == VWEudaChargeMode.PREFERRED_CHARGING_TIMES
+    assert _charge_mode("manual") == VWEudaChargeMode.MANUAL
+    assert _charge_mode("timer") == VWEudaChargeMode.TIMER
+    assert _charge_mode("something_new") == VWEudaChargeMode.UNKNOWN
+
+
+def test_charge_mode_dotted_mapping(connector):
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "settings.charge_mode_selection",
+             "value": "CHARGE_MODE_SELECTION_PREFERRED_CHARGING_TIMES"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.settings.charge_mode.value == VWEudaChargeMode.PREFERRED_CHARGING_TIMES
+
+
+def test_charge_mode_flat_options_mapping(connector):
+    """Flat/continuous format: the active per-option boolean wins."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "charge_mode_selection_options.manual", "value": "false"},
+            {"key": "k2", "dataFieldName": "charge_mode_selection_options.timer_charging", "value": "true"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.settings.charge_mode.value == VWEudaChargeMode.TIMER
+
+
+def test_charge_mode_absent_leaves_attribute_unset(connector):
+    """A vehicle that does not report the field gets no charge_mode attribute
+    (no regression on brands/platforms without it, e.g. many VWs)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "mileage.value", "value": "100"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert getattr(v.charging.settings, "charge_mode", None) is None
+
+
+def test_flat_charge_power_and_rate_deci_scaling(connector):
+    """Flat-format charge power/rate are deci integers (99 -> 9.9)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+            {"key": "k2", "dataFieldName": "charging_power", "value": "99"},
+            {"key": "k3", "dataFieldName": "actual_charge_rate", "value": "99"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.charging.power.value == 9.9   # 99 / 10 kW
+    assert v.charging.rate.value == 9.9    # 99 / 10 (km/h default)
+
+
+def test_dotted_charge_power_takes_precedence_over_flat(connector):
+    """The dotted battery_state_report.charge_power is already kW: when present,
+    the flat deci-kW field must be ignored (no mis-scaling)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+            {"key": "k2", "dataFieldName": "battery_state_report.charge_power", "value": "7.4"},
+            {"key": "k3", "dataFieldName": "charging_power", "value": "99"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).charging.power.value == 7.4   # dotted wins, no /10
+
+
+def test_freshest_numeric_by_prefix_skips_enum_companion():
+    """The prefix lookup returns the numeric physicalValue and skips the
+    companion value_type enum; unknown prefixes return None."""
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "energy_contents.maximal_energy_content.value_type",
+             "value": "SOME_ENUM"},
+            {"key": "k2", "dataFieldName": "energy_contents.maximal_energy_content.physicalValue",
+             "value": "128"},
+        ]
+    })
+    assert ds.freshest_numeric_by_prefix("energy_contents.maximal_energy_content") == 128
+    assert ds.freshest_numeric_by_prefix("energy_contents.current_energy_content") is None
+
+
+def test_battery_available_capacity_mapping(connector):
+    """maximal_energy_content maps to battery.available_capacity in kWh (value/10)."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+            {"key": "k2", "dataFieldName": "energy_contents.maximal_energy_content.physicalValue",
+             "value": "128"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_electric_drive()
+    assert drive is not None
+    assert drive.battery.available_capacity.value == 12.8  # 128 / 10 kWh
+
+
+def test_request_type_threads_through_client(monkeypatch):
+    """client request_type defaults to 'partial' (unchanged behaviour) and, when
+    set to 'all', changes both the metadata path segment and the type header."""
+    from carconnectivity_connectors.vw_eu_data_act.client import EudaApiClient
+    client = EudaApiClient("user@example.com", "secret")
+    monkeypatch.setattr(client, "ensure_login", lambda: None)
+
+    seen = {}
+
+    def fake_get_json(url, *, headers=None, _retry=True):
+        seen["url"] = url
+        seen["headers"] = headers
+        return {"Identifier": "id"} if "metadata" in url else []
+    monkeypatch.setattr(client, "_get_json", fake_get_json)
+
+    client.get_metadata("VIN1")
+    assert seen["url"].endswith("/metadata/partial")
+    client.get_metadata("VIN1", "all")
+    assert seen["url"].endswith("/metadata/all")
+
+    client.list_datasets("VIN1", "id", "all")
+    assert seen["headers"] == {"type": "all"}
+    client.list_datasets("VIN1", "id")
+    assert seen["headers"] == {"type": "partial"}
+
+    captured = {}
+
+    class _FakeResp:
+        status_code = 200
+        content = b""
+
+    def fake_session_get(url, *, headers=None):
+        captured["headers"] = headers
+        return _FakeResp()
+    monkeypatch.setattr(client, "_session_get", fake_session_get)
+    monkeypatch.setattr(client, "_unzip_json", lambda content, name: {})
+
+    client.download_dataset("VIN1", "id", "file.zip", "all")
+    assert captured["headers"] == {"filename": "file.zip", "type": "all"}
+    client.download_dataset("VIN1", "id", "file.zip")
+    assert captured["headers"] == {"filename": "file.zip", "type": "partial"}
+
+
+def test_by_field_prefers_freshest_timestamp():
+    """When a field appears several times, the reading with the latest
+    timestampUtc wins, even if a staler reading has a smaller UUID (which the
+    old smallest-UUID rule would have picked)."""
+    data = [
+        {"key": "aaaa", "dataFieldName": "oil_level_actual_level",
+         "value": "100.0", "timestampUtc": "2026-06-23T15:14:12.000Z"},
+        {"key": "zzzz", "dataFieldName": "oil_level_actual_level",
+         "value": "87.5", "timestampUtc": "2026-06-25T10:37:14.000Z"},
+    ]
+    assert Dataset.from_json({"vin": VIN, "Data": data}).value_of("oil_level_actual_level") == 87.5
+
+
+def test_merge_prefers_freshest_timestamp_regardless_of_list_order():
+    """A stale reading in a later-listed dataset must not override a fresher one.
+    Reproduces the oil-level bug: oil 100.0 measured 2026-06-23 must lose to oil
+    87.5 measured 2026-06-25 whatever the merge order."""
+    fresh = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k1", "dataFieldName": "oil_level_actual_level",
+         "value": "87.5", "timestampUtc": "2026-06-25T10:37:14.000Z"},
+    ]})
+    stale = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k2", "dataFieldName": "oil_level_actual_level",
+         "value": "100.0", "timestampUtc": "2026-06-23T15:14:12.000Z"},
+    ]})
+    assert Dataset.merge([fresh, stale]).value_of("oil_level_actual_level") == 87.5
+    assert Dataset.merge([stale, fresh]).value_of("oil_level_actual_level") == 87.5
+
+
+def test_merge_timestampless_field_keeps_list_order():
+    """Fields without timestampUtc keep the previous behaviour: the later dataset
+    in list order wins (no regression for timestamp-less fields)."""
+    first = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k1", "dataFieldName": "charging_state", "value": "off"},
+    ]})
+    second = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k2", "dataFieldName": "charging_state", "value": "charging"},
+    ]})
+    assert Dataset.merge([first, second]).value_of("charging_state") == "charging"
+
+
+def test_freshest_max_value_prefers_highest_equal_freshness():
+    """Two equally-fresh mileage slots: by_field takes the stable smallest-UUID
+    (which can be the lower reading); freshest_max_value_of prefers the highest."""
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70876", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+            {"key": "bbbbbbbb-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70908", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        ]
+    })
+    assert ds.by_field("mileage.value").value == 70876          # arbitrary stable choice
+    assert ds.freshest_max_value_of("mileage.value") == 70908   # highest slot wins
+
+
+def test_freshest_max_value_single_and_absent():
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [{"key": "k1", "dataFieldName": "mileage.value", "value": "12345"}],
+    })
+    assert ds.freshest_max_value_of("mileage.value") == 12345
+    assert ds.freshest_max_value_of("does.not.exist") is None
+
+
+def test_odometer_prefers_highest_slot(connector):
+    """The mapped odometer never reads low when a dataset carries several
+    equally-fresh mileage slots."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({
+        "vin": VIN,
+        "Data": [
+            {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70876", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+            {"key": "bbbbbbbb-0000-0000-0000-000000000000", "dataFieldName": "mileage.value",
+             "value": "70908", "timestampUtc": "2026-05-31T14:11:43.000Z"},
+        ]
+    })
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).odometer.value == 70908
