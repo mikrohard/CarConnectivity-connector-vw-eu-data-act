@@ -770,6 +770,35 @@ def test_petrol_empty_scr_range_stays_combustion_no_crash(connector):
     assert str(drive.type.value) == "Type.GASOLINE"
 
 
+def test_oil_level_mapped_when_core_supports_it(connector):
+    """oil_level_actual_level maps onto the combustion drive's oil_level. The
+    attribute only exists in carconnectivity cores that shipped it, so the mapping
+    is hasattr-guarded; the test skips (rather than fails) on an older core."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "60"},
+        {"key": "b", "dataFieldName": "oil_level_actual_level", "value": "87.5"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    drive = garage.get_vehicle(VIN).get_combustion_drive()
+    if not hasattr(drive, "oil_level"):
+        pytest.skip("installed carconnectivity core has no oil_level attribute yet")
+    assert drive.oil_level.value == 87.5
+
+
+def test_oil_level_does_not_crash_on_older_core(connector):
+    """Even without oil_level in the core, mapping an oil dataset must not raise."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "60"},
+        {"key": "b", "dataFieldName": "oil_level_actual_level", "value": "87.5"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access  # must not raise
+
+
 PHEV_SAMPLE = os.path.join(os.path.dirname(__file__), "phev_sample_dataset.json")
 
 

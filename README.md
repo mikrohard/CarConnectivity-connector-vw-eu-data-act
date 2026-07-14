@@ -162,6 +162,7 @@ Both the dotted (nested) and flat portal field names are accepted. Drive slots f
 | `cruising_range_primary_engine` | `drive.range` (km) | |
 | `long_term_data_average_fuel_consumption` | `drive.consumption` | L/1000km → L/100km |
 | `scr_range` | `drive.adblue_range` (km) | diesel / SCR |
+| `oil_level_actual_level` | `drive.oil_level` (%) | requires a carconnectivity core with `oil_level`; skipped on older cores |
 
 ### Charging
 
@@ -184,7 +185,9 @@ These portal fields have **no native CarConnectivity model**, so they are left a
 - **Tyre pressures** (`tyre_pressure_actual/required/differential_*`) — no tyre-pressure model.
 - **Instrument-cluster warnings** (`active_warnings_in_instrument_cluster_*`) — no warning model; the
   value is also a latched hex bitmask that does not clear reliably.
-- **Oil level** (`oil_level_*`) — no oil model.
+- **Oil level extras** (`oil_level_additional_oil_level`, `oil_level_dipstick_indicator_function`,
+  `oil_level_total_max`) — VW-specific quirks with no native model; the actual oil level
+  (`oil_level_actual_level`) *is* mapped to `drive.oil_level` (see above).
 - **Trip statistics** (`short_/long_term_data_*`: average speed, trip mileage, travel time,
   recuperation, aux/gas consumption, zero-emission distance) — no trip-statistics model.
 - **"Safe" / secured states** (`safe_state_*`), `parking_brake`, `state_spoiler`,

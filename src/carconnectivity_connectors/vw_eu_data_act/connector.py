@@ -205,6 +205,7 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'cruising_range_secondary_engine',
     'cruising_range_combined',
     'scr_range',
+    'oil_level_actual_level',
     # Door / window / light status (mapped in _map_status).
     'window_heating_state_front',
     'window_heating_state_rear',
@@ -1263,6 +1264,14 @@ class Connector(BaseConnector):
         if isinstance(consumption, (int, float)):
             drive.consumption._set_value(  # pylint: disable=protected-access
                 value=round(consumption / 10, 1), measured=captured_at, unit=FuelConsumption.L100KM)
+
+        # Engine oil level (%). oil_level lives on CombustionDrive in carconnectivity,
+        # but only since the release that added it, so guard with hasattr to stay
+        # compatible with older cores (the attribute is simply skipped there).
+        oil = dataset.value_of('oil_level_actual_level')
+        if isinstance(oil, (int, float)) and hasattr(drive, 'oil_level'):
+            drive.oil_level._set_value(value=oil, measured=captured_at)  # pylint: disable=protected-access
+            drive.oil_level.precision = 0.1
 
         # SCR / AdBlue range (diesel only; empty on petrol / PHEV). adblue_range
         # exists only on DieselDrive, so guard exactly like the official connectors.
