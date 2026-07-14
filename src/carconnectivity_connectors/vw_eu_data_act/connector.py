@@ -211,6 +211,7 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'window_heating_state_rear',
     'lock_state',
     'parking_lights',
+    'parking_brake',
     'open_state_front_left_door', 'open_state_front_right_door',
     'open_state_rear_left_door', 'open_state_rear_right_door',
     'open_state_front_engine_bonnet', 'open_state_tailgate',
@@ -931,6 +932,13 @@ class Connector(BaseConnector):
 
         # Doors, windows and lights status (applies to all vehicles).
         self._map_status(vehicle, dataset, captured_at)
+
+        # Parking brake (0 = released, 1 = engaged). parking_brake exists on the
+        # vehicle only since the carconnectivity release that added it, so guard
+        # with hasattr to stay compatible with older cores.
+        parking_brake = dataset.value_of('parking_brake')
+        if parking_brake in (0, 1) and hasattr(vehicle, 'parking_brake'):
+            vehicle.parking_brake._set_value(value=bool(parking_brake), measured=captured_at)  # pylint: disable=protected-access
 
         # Drive slots follow the portal's primary/secondary engines (same convention
         # as the official seatcupra connector): on a PHEV the primary engine is the

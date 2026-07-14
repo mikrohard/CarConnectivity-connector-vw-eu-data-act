@@ -134,6 +134,7 @@ Both the dotted (nested) and flat portal field names are accepted. Drive slots f
 | `position_*_window_lifter` (fallback `state_*_window_lifter`) | `vehicle.windows[*].open_state` | opening % → closed / ajar / open; incl. sunroof |
 | `window_heating_state` (+ `_front` / `_rear`) | `vehicle.window_heatings` (overall + per element) | |
 | `parking_lights` | `vehicle.lights[parking].light_state` | |
+| `parking_brake` | `vehicle.parking_brake` | 1 → engaged, 0 → released; requires a core with `parking_brake`, skipped on older cores |
 | `cruising_range_combined` | `vehicle.drives.total_range` (km) | |
 
 ### Maintenance & climatisation
@@ -190,7 +191,7 @@ These portal fields have **no native CarConnectivity model**, so they are left a
   (`oil_level_actual_level`) *is* mapped to `drive.oil_level` (see above).
 - **Trip statistics** (`short_/long_term_data_*`: average speed, trip mileage, travel time,
   recuperation, aux/gas consumption, zero-emission distance) — no trip-statistics model.
-- **"Safe" / secured states** (`safe_state_*`), `parking_brake`, `state_spoiler`,
+- **"Safe" / secured states** (`safe_state_*`), `state_spoiler`,
   `state_service_hatch`, `state_of_hood`, `bem_level`, `energy_flow` — no attribute.
 - **Exact window opening percentage** — used to derive the window `open_state` (closed / ajar / open),
   but the `Window` model has no numeric position attribute, so the percentage itself is not stored.
