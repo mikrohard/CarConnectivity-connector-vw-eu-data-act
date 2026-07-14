@@ -24,7 +24,7 @@ from enum import Enum
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
 from carconnectivity.units import Energy, EnergyConsumption, FuelConsumption, Length, Power, Speed, Temperature
-from carconnectivity.attributes import DurationAttribute, EnumAttribute
+from carconnectivity.attributes import DateAttribute, DurationAttribute, EnumAttribute
 from carconnectivity.vehicle import GenericVehicle, ElectricVehicle, CombustionVehicle
 from carconnectivity.drive import CombustionDrive, DieselDrive, ElectricDrive, GenericDrive
 from carconnectivity.battery import Battery
@@ -735,7 +735,7 @@ class Connector(BaseConnector):
         if self._last_dataset.get(vin) != newest['name']:
             payload = self.client.download_dataset(vin, identifier, newest['name'])
             dataset = Dataset.from_json(payload)
-            self._map_dataset(vin, dataset)
+            self._map_dataset(vin, dataset, _created_on(newest))
             self._last_dataset[vin] = newest['name']
         self._historical_recon(vin)
         return newest_created
@@ -799,7 +799,7 @@ class Connector(BaseConnector):
         self._merged_datasets[vin] = merged
         self._observed_fields[vin] = set(merged.field_names)
         self._detect_unmapped_fields(vin, merged)
-        self._map_dataset(vin, merged)
+        self._map_dataset(vin, merged, _created_on(listing[-1]) if listing else None)
         self._bootstrapped.add(vin)
         LOG.info('Bootstrapped vehicle %s: merged %d datasets, %d unique fields',
                  vin, len(datasets), len(merged.field_names))
@@ -816,8 +816,11 @@ class Connector(BaseConnector):
 
     # -- mapping -----------------------------------------------------------
 
-    def _map_dataset(self, vin: str, dataset: Dataset) -> None:
-        """Map an EU Data Act dataset onto native CarConnectivity attributes (read-only)."""
+    def _map_dataset(self, vin: str, dataset: Dataset, created_on: Optional[datetime] = None) -> None:
+        """Map an EU Data Act dataset onto native CarConnectivity attributes (read-only).
+
+        ``created_on`` is the portal createdOn of the mapped dataset, used as the
+        freshness fallback when the data format carries no per-field timestampUtc."""
         garage: Garage = self.car_connectivity.garage
         vehicle: Optional[VWEudaVehicle] = garage.get_vehicle(vin)  # pyright: ignore[reportAssignmentType]
         if vehicle is None:
@@ -865,6 +868,22 @@ class Connector(BaseConnector):
             garage.replace_vehicle(vin, vehicle)
             vehicle.type._set_value(desired_type)  # pylint: disable=protected-access
         is_phev = has_electric and has_fuel
+
+        # Dataset freshness, exposed PER VEHICLE: one connector serves several VINs,
+        # each with its own capture time, so this cannot live on the connector. It is
+        # (re)created lazily on the current instance because the promotion above swaps
+        # in a subclass that does not carry custom attributes over. The base MQTT
+        # plugin auto-publishes it, so it can back a `device_class: timestamp` sensor.
+        # Prefer the precise per-measurement time (max timestampUtc); fall back to the
+        # dataset's createdOn when the portal format carries no field timestamps.
+        freshness = captured_at or created_on
+        if freshness is not None:
+            cap_attr = getattr(vehicle, 'captured_at', None)
+            if not isinstance(cap_attr, DateAttribute):
+                cap_attr = DateAttribute(name='captured_at', parent=vehicle, tags={'connector_custom'})
+                vehicle.captured_at = cap_attr
+            if cap_attr.value is None or freshness > cap_attr.value:
+                cap_attr._set_value(value=freshness)  # pylint: disable=protected-access
 
         # Odometer (mileage.value). The portal reports km or miles depending on
         # the vehicle; the unit comes from the companion mileage.unit enum, with
