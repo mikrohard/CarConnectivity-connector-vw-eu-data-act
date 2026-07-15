@@ -21,7 +21,7 @@ import requests
 
 from carconnectivity.units import Length, Speed
 
-from carconnectivity_connectors.vw_eu_data_act.client import ApiError, EudaApiClient
+from carconnectivity_connectors.vw_eu_data_act.client import ApiError, AuthError, EudaApiClient
 from carconnectivity_connectors.vw_eu_data_act.connector import (
     Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS,
     _charge_mode, _charge_mode_flat, VWEudaChargeMode,
@@ -1187,3 +1187,89 @@ def test_odometer_prefers_highest_slot(connector):
     connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
 
     assert garage.get_vehicle(VIN).odometer.value == 70908
+
+
+# --- login verdict (issue #29) ----------------------------------------------
+
+PORTAL = "https://eu-data-act.drivesomethinggreater.com"
+
+
+class _FakeResp:
+    """Minimal stand-in for requests.Response in login-verdict tests."""
+
+    def __init__(self, url, status_code=200, history=(), text=""):
+        self.url = url
+        self.status_code = status_code
+        self.history = list(history)
+        self.text = text
+
+
+def _callback_hop():
+    return _FakeResp(PORTAL + "/services/callbacklogin?state=ch__en__VOLKSWAGEN_PASSENGER_CARS&code=x",
+                     status_code=302)
+
+
+def _client_with_probe(status_code):
+    client = EudaApiClient(email="u", password="p")
+    client._session.get = lambda url, **kwargs: _FakeResp(url, status_code)
+    return client
+
+
+def test_login_missing_landing_page_is_not_a_failure():
+    """A 4xx on the localized CMS landing page after the chain passed
+    /services/callbacklogin is cosmetic (the page does not exist for e.g.
+    country "ch", issue #29): the login must be treated as successful."""
+    client = _client_with_probe(200)
+    resp = _FakeResp(PORTAL + "/ch/en/user.html", status_code=404, history=[_callback_hop()])
+    client._finish_login(resp)  # pylint: disable=protected-access
+
+
+def test_login_4xx_without_callback_still_fails():
+    """A 4xx at the end of a chain that never reached the portal callback is a
+    real login failure and must keep raising AuthError."""
+    client = _client_with_probe(200)
+    resp = _FakeResp("https://identity.vwgroup.io/signin-service/v1/x/login/authenticate",
+                     status_code=400)
+    with pytest.raises(AuthError, match="Login rejected"):
+        client._finish_login(resp)  # pylint: disable=protected-access
+
+
+def test_login_bad_credentials_still_detected():
+    """Bad credentials re-render the identity sign-in page (HTTP 200, URL still
+    on signin-service): detection must be unchanged."""
+    client = _client_with_probe(200)
+    resp = _FakeResp("https://identity.vwgroup.io/signin-service/v1/x/login/authenticate",
+                     status_code=200)
+    with pytest.raises(AuthError, match="check email and password"):
+        client._finish_login(resp)  # pylint: disable=protected-access
+
+
+def test_login_terms_interstitial_gets_specific_message():
+    """The terms-and-conditions interstitial (issue #15) is a real login stop,
+    but the generic "check email and password" message is misleading there: a
+    dedicated message must point at the terms acceptance instead."""
+    client = _client_with_probe(200)
+    resp = _FakeResp("https://identity.vwgroup.io/signin-service/v1/x/terms-and-conditions"
+                     "?relayState=y&updated=dataprivacy",
+                     status_code=200)
+    with pytest.raises(AuthError, match="terms and conditions"):
+        client._finish_login(resp)  # pylint: disable=protected-access
+
+
+def test_login_probe_rejects_sessionless_login():
+    """If the authenticated probe answers 401/403, no session was established:
+    the login must fail with a clear message instead of failing later with a
+    confusing error on the first API call."""
+    client = _client_with_probe(401)
+    resp = _FakeResp(PORTAL + "/ch/en/user.html", status_code=404, history=[_callback_hop()])
+    with pytest.raises(AuthError, match="did not establish a session"):
+        client._finish_login(resp)  # pylint: disable=protected-access
+
+
+def test_login_probe_tolerates_portal_hiccup():
+    """A probe failure other than 401/403 (e.g. HTTP 500) is not an
+    authentication verdict: the login proceeds and the regular request path
+    handles the outage on its own retry cadence."""
+    client = _client_with_probe(500)
+    resp = _FakeResp(PORTAL + "/si/sl/user.html", status_code=200, history=[_callback_hop()])
+    client._finish_login(resp)  # pylint: disable=protected-access
