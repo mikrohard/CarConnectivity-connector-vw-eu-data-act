@@ -166,6 +166,21 @@ def _login_error(html: str) -> Optional[str]:
     return str(err) if err else None
 
 
+def _passed_portal_callback(resp: requests.Response) -> bool:
+    """Return True if the redirect chain went through the portal login callback.
+
+    ``/services/callbacklogin`` is the hop that exchanges the OIDC code and sets
+    the portal session cookies, so reaching it means authentication completed
+    whatever the final localized landing page returns.
+    """
+    portal_host = urlparse(BASE_URL).netloc
+    for hop in list(resp.history) + [resp]:
+        parsed = urlparse(hop.url)
+        if parsed.netloc == portal_host and parsed.path.startswith("/services/callbacklogin"):
+            return True
+    return False
+
+
 def _extract_vins(payload) -> List[dict]:
     """Best-effort extraction of vehicles from the (undocumented) vehicles body.
 
@@ -302,13 +317,37 @@ class EudaApiClient:
             headers={"Referer": authenticate_url},
             timeout=self._timeout,
         )
+        self._finish_login(resp)
+
+    def _finish_login(self, resp: requests.Response) -> None:
+        """Judge the end of the credentials redirect chain and confirm the session.
+
+        The chain ends on a localized CMS landing page whose availability is
+        unrelated to authentication - it simply does not exist for some locales
+        (e.g. country "ch", issue #29). Once the chain has passed the portal's
+        /services/callbacklogin hop the session cookies are set, so the landing
+        page status alone must not fail the login.
+        """
         landing = resp.url
         landing_html = resp.text
         if resp.status_code >= 400:
-            LOG.debug("login step4: HTTP %s body[:500]=%s", resp.status_code, landing_html[:500])
-            err = _login_error(landing_html)
-            raise AuthError(err or f"Login rejected (HTTP {resp.status_code})")
+            if not _passed_portal_callback(resp):
+                LOG.debug("login step4: HTTP %s body[:500]=%s", resp.status_code, landing_html[:500])
+                err = _login_error(landing_html)
+                raise AuthError(err or f"Login rejected (HTTP {resp.status_code})")
+            LOG.debug("login step4: landing page HTTP %s ignored (callbacklogin passed): %s",
+                      resp.status_code, landing)
         LOG.debug("login step4: landed on %s", landing)
+
+        # The IdP can interrupt the flow with a terms-and-conditions interstitial
+        # (e.g. ?updated=dataprivacy). Authentication has genuinely not completed,
+        # but "check email and password" would be misleading there (issue #15).
+        if "terms-and-conditions" in landing:
+            raise AuthError(
+                "Login interrupted: the identity provider requires accepting updated "
+                "terms and conditions for this account (try completing a login in a "
+                "browser first). See connector issue #15."
+            )
 
         # Positively confirm success: a completed flow lands back on the portal
         # host (via /services/callbacklogin). Bad credentials re-render the
@@ -318,6 +357,19 @@ class EudaApiClient:
             raise AuthError("Login failed - check email and password")
         if urlparse(landing).netloc != portal_host:
             raise AuthError(f"Login did not complete (ended at {landing})")
+
+        # Prove the session with a cheap authenticated call instead of trusting
+        # the landing page. Only 401/403 is an authentication verdict; anything
+        # else (portal hiccup, network blip) is left to the regular request
+        # path, which retries on the connector interval.
+        try:
+            probe = self._session.get(BASE_URL + VEHICLES_PATH, timeout=self._timeout)
+        except requests.RequestException as err:
+            LOG.debug("login step5: session probe network error ignored: %s", err)
+            return
+        if probe.status_code in (401, 403):
+            raise AuthError(f"Login did not establish a session (probe HTTP {probe.status_code})")
+        LOG.debug("login step5: session probe HTTP %s", probe.status_code)
 
     def _build_authorize_url(self) -> str:
         """Construct the OIDC authorize URL (bypasses the broken AEM servlet)."""
