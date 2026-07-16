@@ -212,7 +212,7 @@ class EudaApiClient:
 
     def __init__(self, email: str, password: str, *, country: str = DEFAULT_COUNTRY,
                  language: str = DEFAULT_LANGUAGE, brand: str = DEFAULT_BRAND,
-                 timeout: int = 60) -> None:
+                 timeout: int = 60, accept_terms_on_login: bool = False) -> None:
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": USER_AGENT})
         # Retry transient connection/5xx errors at the transport layer so a single
@@ -234,6 +234,7 @@ class EudaApiClient:
         self._state = f"{country}__{language}__{resolved.key}"
         self._client_id = resolved.client_id
         self._timeout = timeout
+        self._accept_terms_on_login = accept_terms_on_login
         self._logged_in = False
 
     def close(self) -> None:
@@ -319,7 +320,7 @@ class EudaApiClient:
         )
         self._finish_login(resp)
 
-    def _finish_login(self, resp: requests.Response) -> None:
+    def _finish_login(self, resp: requests.Response, _terms_retried: bool = False) -> None:
         """Judge the end of the credentials redirect chain and confirm the session.
 
         The chain ends on a localized CMS landing page whose availability is
@@ -342,11 +343,19 @@ class EudaApiClient:
         # The IdP can interrupt the flow with a terms-and-conditions interstitial
         # (e.g. ?updated=dataprivacy). Authentication has genuinely not completed,
         # but "check email and password" would be misleading there (issue #15).
+        # With accept_terms_on_login enabled, POST the acceptance embedded in the
+        # page and resume the flow (once: a second interstitial means the
+        # acceptance was not recorded and retrying would loop).
         if "terms-and-conditions" in landing:
+            if self._accept_terms_on_login and not _terms_retried:
+                LOG.info("Login interrupted by a terms-and-conditions update; "
+                         "accepting it (accept_terms_on_login is enabled)")
+                self._finish_login(self._accept_terms(landing, landing_html), _terms_retried=True)
+                return
             raise AuthError(
                 "Login interrupted: the identity provider requires accepting updated "
                 "terms and conditions for this account (try completing a login in a "
-                "browser first). See connector issue #15."
+                "browser first, or set accept_terms_on_login). See connector issue #15."
             )
 
         # Positively confirm success: a completed flow lands back on the portal
@@ -370,6 +379,43 @@ class EudaApiClient:
         if probe.status_code in (401, 403):
             raise AuthError(f"Login did not establish a session (probe HTTP {probe.status_code})")
         LOG.debug("login step5: session probe HTTP %s", probe.status_code)
+
+    def _accept_terms(self, url: str, html: str) -> requests.Response:
+        """POST the acceptance form of a terms-and-conditions interstitial.
+
+        The page embeds a genuine acceptance form in its JS ``templateModel``
+        (issue #15): ``relayState``/``hmac``, ``countryOfResidence`` (sent
+        upper-cased) and the pending document flattened into
+        ``legalDocuments[0].<key>`` fields with booleans as ``yes``/``no``
+        (link/version/summary keys are not part of the form). Same scheme as
+        the seatcupra connector and WeConnect-python's acceptTermsOnLogin.
+        The IdP records the acceptance account-side and resumes the OIDC flow.
+        """
+        model = _extract_template_model(html)
+        fields: Dict[str, str] = {}
+        for key in ("relayState", "hmac"):
+            if model.get(key):
+                fields[key] = model[key]
+        country = model.get("countryOfResidence")
+        if country:
+            fields["countryOfResidence"] = str(country).upper()
+        documents = model.get("legalDocuments") or []
+        document = documents[0] if documents else {}
+        for key, value in document.items():
+            if key in ("skipLink", "declineLink", "majorVersion", "minorVersion", "changeSummary"):
+                continue
+            fields[f"legalDocuments[0].{key}"] = ("yes" if value else "no") if isinstance(value, bool) else value
+        csrf = _extract_csrf(html)
+        if csrf:
+            fields["_csrf"] = csrf
+        # The form target is the templateModel's loginUrl when present; fall
+        # back to the page URL stripped of its query (both observed working).
+        action = urljoin(url, model["loginUrl"]) if model.get("loginUrl") else url.split("?", 1)[0]
+        LOG.info("login terms: accepting document %s v%s.%s",
+                 document.get("name") or document.get("textId") or "?",
+                 document.get("majorVersion", "?"), document.get("minorVersion", "?"))
+        LOG.debug("login terms: POST acceptance to %s fields=%s", action, sorted(fields))
+        return self._session.post(action, data=fields, headers={"Referer": url}, timeout=self._timeout)
 
     def _build_authorize_url(self) -> str:
         """Construct the OIDC authorize URL (bypasses the broken AEM servlet)."""
