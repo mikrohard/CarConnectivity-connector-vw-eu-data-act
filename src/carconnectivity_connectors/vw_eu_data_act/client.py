@@ -57,6 +57,22 @@ USER_AGENT = (
 NO_CONTENT_SUFFIX = "_no_content_found.zip"
 
 
+def _accept_language(country: str, language: str) -> str:
+    """Browser-like ``Accept-Language`` derived from the configured locale.
+
+    The identity provider resolves per-locale variants of pending legal
+    documents from this header; a header-less client can be routed to a
+    terms-and-conditions interstitial for a document variant the user was
+    never offered by any official VW surface (issue #15). Every official
+    client sends this header.
+    """
+    lang = language.lower()
+    parts = [f"{lang}-{country.upper()}", f"{lang};q=0.9"]
+    if lang != "en":
+        parts.append("en;q=0.8")
+    return ",".join(parts)
+
+
 class ApiError(Exception):
     """Generic API failure."""
 
@@ -214,7 +230,16 @@ class EudaApiClient:
                  language: str = DEFAULT_LANGUAGE, brand: str = DEFAULT_BRAND,
                  timeout: int = 60) -> None:
         self._session = requests.Session()
-        self._session.headers.update({"User-Agent": USER_AGENT})
+        # Browser-like header set: the IdP routes header-less clients to legal
+        # interstitials a browser never sees (issue #15), Accept-Language being
+        # the prime suspect. Accept keeps */* so the proxy_api JSON responses
+        # are unaffected.
+        self._session.headers.update({
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": _accept_language(country, language),
+            "Upgrade-Insecure-Requests": "1",
+        })
         # Retry transient connection/5xx errors at the transport layer so a single
         # dropped connection (the portal/Azure blob occasionally closes idle
         # sockets) does not bubble up as a hard failure.
