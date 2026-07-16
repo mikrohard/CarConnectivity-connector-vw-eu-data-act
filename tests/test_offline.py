@@ -1273,3 +1273,82 @@ def test_login_probe_tolerates_portal_hiccup():
     client = _client_with_probe(500)
     resp = _FakeResp(PORTAL + "/si/sl/user.html", status_code=200, history=[_callback_hop()])
     client._finish_login(resp)  # pylint: disable=protected-access
+
+
+# --- terms-and-conditions auto-acceptance (issue #15) ------------------------
+
+TERMS_URL = ("https://identity.vwgroup.io/signin-service/v1/xxx@apps_vw-dilab_com/"
+             "terms-and-conditions?relayState=rs1&updated=dataprivacy")
+
+# Shape observed in issue #15: the acceptance form lives in the JS
+# templateModel, with the pending document under legalDocuments[0].
+TERMS_HTML = """
+<script>
+window._IDK = {
+  templateModel: {"relayState": "rs1", "hmac": "h1", "countryOfResidence": "ch",
+    "loginUrl": "/signin-service/v1/xxx@apps_vw-dilab_com/terms-and-conditions",
+    "legalDocuments": [{"name": "dataPrivacy", "textId": "t16",
+      "majorVersion": 16, "minorVersion": 1,
+      "skippable": false, "declinable": true, "saveLink": "/save",
+      "skipLink": "/skip", "declineLink": "/decline", "changeSummary": "upd"}]},
+  csrf_token: 'tok123'
+};
+</script>
+"""
+
+
+def _terms_client(accept, post_result):
+    """Client whose POSTs are captured and whose GET probe answers 200."""
+    client = EudaApiClient(email="u", password="p", accept_terms_on_login=accept)
+    calls = []
+
+    def _post(url, data=None, **kwargs):
+        calls.append((url, data))
+        return post_result
+
+    client._session.post = _post
+    client._session.get = lambda url, **kwargs: _FakeResp(url, 200)
+    return client, calls
+
+
+def test_terms_interstitial_accepted_when_opted_in():
+    """With accept_terms_on_login, the acceptance form embedded in the
+    interstitial's templateModel is POSTed (issue #15 recipe: countryOfResidence
+    upper-cased, legalDocuments[0].* flattened with yes/no booleans, link and
+    version keys excluded, _csrf from csrf_token) and the login completes."""
+    success = _FakeResp(PORTAL + "/si/sl/user.html", status_code=200, history=[_callback_hop()])
+    client, calls = _terms_client(True, success)
+    client._finish_login(_FakeResp(TERMS_URL, status_code=200, text=TERMS_HTML))  # pylint: disable=protected-access
+
+    assert len(calls) == 1
+    url, data = calls[0]
+    assert url == "https://identity.vwgroup.io/signin-service/v1/xxx@apps_vw-dilab_com/terms-and-conditions"
+    assert data["relayState"] == "rs1"
+    assert data["hmac"] == "h1"
+    assert data["_csrf"] == "tok123"
+    assert data["countryOfResidence"] == "CH"
+    assert data["legalDocuments[0].skippable"] == "no"
+    assert data["legalDocuments[0].declinable"] == "yes"
+    assert data["legalDocuments[0].saveLink"] == "/save"
+    assert data["legalDocuments[0].name"] == "dataPrivacy"
+    for excluded in ("majorVersion", "minorVersion", "skipLink", "declineLink", "changeSummary"):
+        assert f"legalDocuments[0].{excluded}" not in data
+
+
+def test_terms_interstitial_still_raises_without_opt_in():
+    """Without the opt-in, the interstitial keeps raising the dedicated
+    AuthError and nothing is POSTed on the user's behalf."""
+    client, calls = _terms_client(False, None)
+    with pytest.raises(AuthError, match="terms and conditions"):
+        client._finish_login(_FakeResp(TERMS_URL, status_code=200, text=TERMS_HTML))  # pylint: disable=protected-access
+    assert not calls
+
+
+def test_terms_acceptance_does_not_loop():
+    """If the IdP serves the interstitial again after the acceptance POST, the
+    login fails instead of retrying forever."""
+    still_terms = _FakeResp(TERMS_URL, status_code=200, text=TERMS_HTML)
+    client, calls = _terms_client(True, still_terms)
+    with pytest.raises(AuthError, match="terms and conditions"):
+        client._finish_login(_FakeResp(TERMS_URL, status_code=200, text=TERMS_HTML))  # pylint: disable=protected-access
+    assert len(calls) == 1

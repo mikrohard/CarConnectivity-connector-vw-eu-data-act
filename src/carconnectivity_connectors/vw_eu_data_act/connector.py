@@ -478,6 +478,11 @@ class Connector(BaseConnector):
         self.active_config['language'] = config.get('language', DEFAULT_LANGUAGE)
         self.active_config['brand'] = config.get('brand', DEFAULT_BRAND)
 
+        # Opt-in: accept a pending terms-and-conditions/data-privacy document
+        # during login instead of failing (issue #15). Off by default because it
+        # accepts a legal document on the user's behalf.
+        self.active_config['accept_terms_on_login'] = bool(config.get('accept_terms_on_login', False))
+
         # --- hidden VINs ---
         if 'hide_vins' in config and config['hide_vins'] is not None:
             self.active_config['hide_vins'] = config['hide_vins']
@@ -504,7 +509,8 @@ class Connector(BaseConnector):
         self.client: EudaApiClient = EudaApiClient(
             email=self.active_config['username'], password=self.active_config['password'],
             country=self.active_config['country'], language=self.active_config['language'],
-            brand=self.active_config['brand'])
+            brand=self.active_config['brand'],
+            accept_terms_on_login=self.active_config['accept_terms_on_login'])
 
     # -- lifecycle ---------------------------------------------------------
 
