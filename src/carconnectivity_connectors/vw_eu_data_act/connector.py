@@ -721,7 +721,8 @@ class Connector(BaseConnector):
         the portal emits one zip per ~15-min interval, so the next one is due
         ~15 min after the newest one regardless of whether it carried data.
         Returns ``None`` only when there is nothing dated to schedule from
-        (empty/unprovisioned listing), in which case the caller retries soon.
+        (empty/unprovisioned listing), in which case the caller uses the
+        configured polling interval.
         """
         identifier = self._identifiers.get(vin)
         if identifier is None:
@@ -800,6 +801,8 @@ class Connector(BaseConnector):
             self._historical_done.add(vin)
             LOG.info('Historical on-demand export for %s written to %s (%d data points) for inspection.',
                      vin, os.path.abspath(path), len(payload.get('Data', []) if isinstance(payload, dict) else []))
+        except TooManyRequestsError:
+            raise
         except (ApiError, RetrievalError, OSError, ValueError) as err:
             LOG.debug('Historical recon %s failed (will retry next cycle): %s', vin, err)
 
@@ -1380,7 +1383,7 @@ class Connector(BaseConnector):
     # -- scheduling --------------------------------------------------------
 
     def _reschedule(self, next_polls: "List[datetime]") -> None:
-        """Set the next interval ~15 min after the newest dataset, else short retry."""
+        """Set the next interval from dataset cadence or the configured fallback."""
         if next_polls:
             target = min(next_polls)
             delta = target - datetime.now(tz=timezone.utc)
@@ -1388,8 +1391,9 @@ class Connector(BaseConnector):
                 self.interval._set_value(delta)  # pylint: disable=protected-access
                 LOG.debug('Next refresh in %s', delta)
                 return
-        self.interval._set_value(RETRY_INTERVAL)  # pylint: disable=protected-access
-        LOG.debug('Next dataset overdue; retrying in %s', RETRY_INTERVAL)
+        base_interval = timedelta(seconds=self.active_config['interval'])
+        self.interval._set_value(base_interval)  # pylint: disable=protected-access
+        LOG.debug('No future dataset target; retrying in configured interval %s', base_interval)
 
     # -- metadata ----------------------------------------------------------
 

@@ -19,6 +19,7 @@ from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode, urljoin, urlparse
 
 import requests
+from carconnectivity.errors import TooManyRequestsError
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -79,6 +80,14 @@ class ApiError(Exception):
 
 class AuthError(ApiError):
     """Authentication failed or session expired."""
+
+
+def _raise_for_status(response: requests.Response, context: str) -> None:
+    """Translate HTTP failures into connector-aware exceptions."""
+    if response.status_code == 429:
+        raise TooManyRequestsError(f"{context} -> HTTP 429")
+    if response.status_code >= 400:
+        raise ApiError(f"{context} -> HTTP {response.status_code}")
 
 
 class _FormParser(HTMLParser):
@@ -480,8 +489,7 @@ class EudaApiClient:
             self._logged_in = False
             self.login()
             return self._get_json(url, headers=headers, _retry=False)
-        if resp.status_code >= 400:
-            raise ApiError(f"GET {url} -> HTTP {resp.status_code}")
+        _raise_for_status(resp, f"GET {url}")
         try:
             return resp.json()
         except ValueError as err:
@@ -543,8 +551,7 @@ class EudaApiClient:
             self._logged_in = False
             self.login()
             resp = self._session_get(url, headers=headers)
-        if resp.status_code >= 400:
-            raise ApiError(f"Download {name} -> HTTP {resp.status_code}")
+        _raise_for_status(resp, f"Download {name}")
         return self._unzip_json(resp.content, name)
 
     @staticmethod
