@@ -86,10 +86,13 @@ Add a connector of type `vw_eu_data_act` to your `carconnectivity.json`:
 |---|---|---|
 | `username` / `password` | — | VW ID credentials. May instead be provided in `.netrc` under machine `vw_eu_data_act`. |
 | `netrc` | `~/.netrc` | Path to a netrc file (used when `username`/`password` are omitted). |
-| `interval` | `900` | Base poll interval (seconds, min 60). The connector also auto-schedules ~15 min after the newest dataset. |
+| `interval` | `900` | Base poll interval (seconds, min 60). The connector auto-schedules ~15 min after the newest dataset; when no future delivery can be inferred, this configured interval is the fallback. |
 | `country` / `language` / `brand` | `si` / `sl` / `VOLKSWAGEN_PASSENGER_CARS` | OIDC `state` components. Each brand authenticates with its own OIDC `client_id` — set `brand` to match your car (see below). |
 | `vin` | — | Optional. Restrict to a single VIN; otherwise all consented vehicles are used. |
 | `hide_vins` | `[]` | VINs to exclude. |
+
+HTTP 429 responses are treated as rate limits and use the connector's 15-minute
+rate-limit backoff. Other transient API failures retain the short one-minute retry.
 
 ### Supported brands
 
