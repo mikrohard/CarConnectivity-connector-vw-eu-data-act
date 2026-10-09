@@ -22,7 +22,7 @@ from carconnectivity.window_heating import WindowHeatings
 
 import requests
 
-from carconnectivity.units import Length, Speed
+from carconnectivity.units import Energy, Length, Speed
 
 from carconnectivity_connectors.vw_eu_data_act.client import ApiError, AuthError, EudaApiClient
 from carconnectivity_connectors.vw_eu_data_act.connector import (
@@ -2016,6 +2016,56 @@ def test_born_reduced_maps_soc_from_battery_level_hv(connector):
     assert drive.range_estimated_full.value == pytest.approx(485.07, abs=0.01)
     assert drive.battery.available_capacity.value == pytest.approx(77.25)
     assert drive.consumption.value == pytest.approx(15.93, abs=0.01)
+
+
+def test_born_reduced_maps_energy_content_and_battery_care(connector):
+    """Connector attributes for portal data with no core model: current energy
+    (deci-kWh like the maximal one; 514.5 / 772.5 = 66.6 % against the reported
+    67 % SoC) and the battery care mode."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+
+    connector._map_dataset(VIN, _load_born(BORN_REDUCED_SAMPLE))  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    battery = v.get_electric_drive().battery
+    assert battery.energy_content.value == pytest.approx(51.45)
+    assert battery.energy_content.unit == Energy.KWH
+    assert battery.energy_content.tags == {'connector_custom'}
+    assert v.charging.settings.battery_care_mode.value is True
+    assert v.charging.settings.battery_care_mode.tags == {'connector_custom'}
+
+
+def test_connector_attributes_not_created_without_data(connector):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "k1", "dataFieldName": "battery_state_report.soc", "value": "50"},
+    ]}))
+
+    v = garage.get_vehicle(VIN)
+    assert not hasattr(v.get_electric_drive().battery, 'energy_content')
+    assert not hasattr(v.charging.settings, 'battery_care_mode')
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("BCAM_ACTIVATION_ACTIVATED", True),
+    ("BCAM_ACTIVATION_DEACTIVATED", False),
+    ("2", False),  # raw protobuf enum index of DEACTIVATED
+    ("BCAM_ACTIVATION_INVALID", None),
+    ("BCAM_ACTIVATION_SOMETHING_NEW", None),
+])
+def test_battery_care_mode_values(connector, raw, expected):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "5a0b50dc-7e9d-3507-a1c3-d74a066fbf2c", "dataFieldName": "setting.bcam_activation", "value": raw},
+    ]}))
+
+    attr = getattr(garage.get_vehicle(VIN).charging.settings, 'battery_care_mode', None)
+    assert (attr.value if attr is not None else None) is expected
 
 
 def test_born_full_maps_soc_from_named_report(connector):

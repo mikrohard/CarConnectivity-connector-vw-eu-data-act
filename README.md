@@ -181,6 +181,7 @@ delivery's `createdOn` is used as the measurement time rather than leaving it to
 | `range` / `cruising_range_secondary_engine` | `drive.range` (km) | |
 | `long_term_data_average_electr_engine_consumption` | `drive.consumption` | kWh/1000km → kWh/100km |
 | `min_temperature` / `max_temperature` | `battery.temperature_min` / `temperature_max` (°C) | |
+| `energy_contents.current_energy_content.*` | `battery.energy_content` (kWh) | deci-kWh → kWh; connector attribute (tag `connector_custom`), not in the core model |
 
 ### Combustion drive (`primary` on PHEV)
 
@@ -207,6 +208,7 @@ reading is missing.
 | `battery_state_report.charge_rate` (+ unit) | `charging.rate` (km/h or mph) | |
 | `…remaining_charging_time_complete` / `remaining_charging_time` | `charging.estimated_date_reached` | |
 | `settings.target_soc` | `charging.settings.target_level` (%) | |
+| `setting.bcam_activation` | `charging.settings.battery_care_mode` | connector attribute (tag `connector_custom`), not in the core model |
 | `plug_state` | `charging.connector.connection_state` | |
 | `external_power_supply_state` | `charging.connector.external_power` | |
 
@@ -230,7 +232,9 @@ These portal fields have **no native CarConnectivity model**, so they are left a
 - **Raw HV SoC** (`hv_soc`) — the displayed SoC is already mapped to `drive.level`.
 - **Diagnostics / triggers** (`echo`, `trueness`, `charging_state_error_code`,
   `window_heating_error_code`, `charging_reason_trigger`, `led_state` / `led_color`, `cng_gas_level`,
-  `fuel_level__accuracy`, …).
+  `fuel_level__accuracy`, `update_reason`, `charging_state_report.profile_charge_reason`, …).
+- **Climate and residual consumption** (`additional_consumptions.*`) — the data dictionary gives no
+  unit, so any unit shown would be a guess.
 
 ## License
 

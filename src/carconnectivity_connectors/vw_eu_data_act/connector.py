@@ -24,7 +24,7 @@ from enum import Enum
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
 from carconnectivity.units import Energy, EnergyConsumption, FuelConsumption, Length, Power, Speed, Temperature
-from carconnectivity.attributes import DateAttribute, DurationAttribute, EnumAttribute
+from carconnectivity.attributes import BooleanAttribute, DateAttribute, DurationAttribute, EnergyAttribute, EnumAttribute
 from carconnectivity.vehicle import GenericVehicle, ElectricVehicle, CombustionVehicle
 from carconnectivity.drive import CombustionDrive, DieselDrive, ElectricDrive, GenericDrive
 from carconnectivity.battery import Battery
@@ -191,6 +191,20 @@ def _stamp(attr, value, measured: "Optional[datetime]", unit=None) -> None:
     attr._set_value(value=value, measured=measured, unit=unit)  # pylint: disable=protected-access
 
 
+def _custom_attribute(parent, name: str, attr_type: type, **kwargs):
+    """Return the connector-defined attribute ``name`` of ``parent``, creating it once.
+
+    For portal data with no core model: the attribute is created lazily (so
+    vehicles that never report the field do not get an empty one) and tagged
+    ``connector_custom`` instead of ``carconnectivity``.
+    """
+    attr = getattr(parent, name, None)
+    if not isinstance(attr, attr_type):
+        attr = attr_type(name=name, parent=parent, tags={'connector_custom'}, **kwargs)
+        setattr(parent, name, attr)
+    return attr
+
+
 # --- Known mapped fields for detecting unmapped sensors --------------------
 KNOWN_MAPPED_FIELDS: set[str] = {
     'mileage.value',
@@ -219,7 +233,12 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'charging_state_report.charge_type',
     'settings.target_soc',
     'settings.charge_mode_selection',
+    'setting.bcam_activation',
     'car_captured_time',
+    # Known but deliberately unmapped: why the car sent the report / chose to
+    # charge. Diagnostic only, no attribute.
+    'update_reason',
+    'charging_state_report.profile_charge_reason',
     # Flat-format (eGolf) fields handled in _map_dataset.
     'mileage',
     'state_of_charge',
@@ -285,6 +304,7 @@ KNOWN_MAPPED_FIELDS: set[str] = {
 # prefix). Excluded from the unmapped-sensor detection like KNOWN_MAPPED_FIELDS.
 KNOWN_MAPPED_PREFIXES: "Tuple[str, ...]" = (
     'energy_contents.maximal_energy_content',
+    'energy_contents.current_energy_content',
 )
 
 # --- datapoints identified by their portal key only ------------------------
@@ -433,6 +453,12 @@ def _charge_mode(raw) -> "Optional[VWEudaChargeMode]":
     if token.startswith('CHARGE_MODE_SELECTION_'):
         token = token[len('CHARGE_MODE_SELECTION_'):]
     return _CHARGE_MODE_TOKENS.get(token, VWEudaChargeMode.UNKNOWN)
+
+
+_BATTERY_CARE_MODE = {
+    'BCAM_ACTIVATION_ACTIVATED': True,
+    'BCAM_ACTIVATION_DEACTIVATED': False,
+}
 
 
 def _charge_mode_flat(dataset) -> "Optional[VWEudaChargeMode]":
@@ -1206,6 +1232,15 @@ class Connector(BaseConnector):
             _stamp(battery.available_capacity,
                 value=max_energy / 10, measured=captured_at, unit=Energy.KWH)
 
+        # Energy currently stored, on the same deci-kWh scale (the issue #38 Born
+        # export: current/maximal matched the reported SoC). No core model, so a
+        # connector attribute next to available_capacity.
+        energy = dataset.freshest_numeric_by_prefix('energy_contents.current_energy_content')
+        if isinstance(energy, (int, float)):
+            _stamp(_custom_attribute(battery, 'energy_content', EnergyAttribute, unit=Energy.KWH,
+                                     minimum=0, precision=0.1),
+                   energy / 10, measured=captured_at, unit=Energy.KWH)
+
         # Charging power (kW)
         power = dataset.value_of('battery_state_report.charge_power')
         if power is not None:
@@ -1254,13 +1289,16 @@ class Connector(BaseConnector):
         if charge_mode is None:
             charge_mode = _charge_mode_flat(dataset)
         if charge_mode is not None:
-            settings = vehicle.charging.settings
-            charge_mode_attr = getattr(settings, 'charge_mode', None)
-            if not isinstance(charge_mode_attr, EnumAttribute):
-                charge_mode_attr = EnumAttribute(name='charge_mode', parent=settings,
-                                                 value_type=VWEudaChargeMode, tags={'connector_custom'})
-                settings.charge_mode = charge_mode_attr
-            _stamp(charge_mode_attr, charge_mode, measured=captured_at)
+            _stamp(_custom_attribute(vehicle.charging.settings, 'charge_mode', EnumAttribute,
+                                     value_type=VWEudaChargeMode),
+                   charge_mode, measured=captured_at)
+
+        # Battery care mode (BCAM: charging capped to spare the battery). No core
+        # model; read-only. INVALID or an unknown value leaves it untouched.
+        battery_care = _BATTERY_CARE_MODE.get(dataset.value_of('setting.bcam_activation'))
+        if battery_care is not None:
+            _stamp(_custom_attribute(vehicle.charging.settings, 'battery_care_mode', BooleanAttribute),
+                   battery_care, measured=captured_at)
 
         # --- Flat-format charging fields (eGolf / PHEV) ----------------------
         # Mirror the dotted battery_state_report.* / charging_state_report.* fields
