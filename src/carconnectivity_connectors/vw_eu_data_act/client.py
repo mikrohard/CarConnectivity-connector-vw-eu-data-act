@@ -134,6 +134,24 @@ def _raise_for_status(response: requests.Response, context: str) -> None:
         raise ApiError(f"{context} -> HTTP {response.status_code}")
 
 
+def _raise_for_unavailable_login(response: requests.Response, step: str) -> None:
+    """Report a login step the identity service failed, not the credentials.
+
+    5xx and 404 (sign-in service redeploying) are VW outages and 429 is
+    throttling (same classification as HA vw_eu_data_act e4d8055). Without this
+    they surfaced as "could not parse the sign-in form" or "check email and
+    password". 429 becomes ``TooManyRequestsError`` so the loop honours
+    Retry-After; outages stay an ``AuthError`` so the exponential login back-off
+    still applies (#49) instead of a full login every minute during an outage.
+    """
+    status = response.status_code
+    if status == 429:
+        raise TooManyRequestsError(f"Login {step} -> HTTP 429", retry_after=_retry_after_seconds(response))
+    if status >= 500 or status == 404:
+        raise AuthError(f"VW identity service unavailable during login {step} (HTTP {status}); "
+                        "not a credentials problem, will retry")
+
+
 class _FormParser(HTMLParser):
     """Extract the first <form> action and all hidden/input fields."""
 
@@ -356,6 +374,7 @@ class EudaApiClient:
         authorize_url = self._build_authorize_url()
         LOG.debug("login step1: authorize url = %s", authorize_url)
         resp = self._session.get(authorize_url, timeout=self._timeout)
+        _raise_for_unavailable_login(resp, "sign-in page")
         signin_url = resp.url
         signin_html = resp.text
         LOG.debug("login step2: signin page = %s (%d bytes)", signin_url, len(signin_html))
@@ -374,6 +393,7 @@ class EudaApiClient:
             headers={"Referer": signin_url},
             timeout=self._timeout,
         )
+        _raise_for_unavailable_login(resp, "identifier step")
         authenticate_url = resp.url
         authenticate_html = resp.text
         LOG.debug("login step3: after identifier POST status=%s url=%s", resp.status_code, authenticate_url)
@@ -449,6 +469,7 @@ class EudaApiClient:
         longer matters and no session probe is needed afterwards.
         """
         landing = resp.url
+        _raise_for_unavailable_login(resp, "callback" if _is_portal_callback(landing) else "credentials step")
         if _is_portal_callback(landing):
             if resp.status_code >= 400:
                 raise AuthError(f"Login callback rejected (HTTP {resp.status_code})")
