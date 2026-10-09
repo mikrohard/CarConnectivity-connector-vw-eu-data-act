@@ -168,6 +168,12 @@ ENUM_MEMBERS: Dict[str, tuple] = {
         "CHARGE_RATE_UNIT_MILES_PER_H",                                        # 3
         "CHARGE_RATE_UNIT_MILES_PER_MIN",                                      # 4
     ),
+    "settings.auto_unlock_ac": (
+        "AUTO_UNLOCK_AC_INVALID",                                              # 0
+        "AUTO_UNLOCK_AC_OFF",                                                  # 1
+        "AUTO_UNLOCK_AC_PERMANENT",                                            # 2
+        "AUTO_UNLOCK_AC_ONCE",                                                 # 3
+    ),
 }
 
 
