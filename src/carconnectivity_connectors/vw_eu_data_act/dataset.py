@@ -168,6 +168,11 @@ ENUM_MEMBERS: Dict[str, tuple] = {
         "CHARGE_RATE_UNIT_MILES_PER_H",                                        # 3
         "CHARGE_RATE_UNIT_MILES_PER_MIN",                                      # 4
     ),
+    "setting.bcam_activation": (
+        "BCAM_ACTIVATION_INVALID",                                             # 0
+        "BCAM_ACTIVATION_ACTIVATED",                                           # 1
+        "BCAM_ACTIVATION_DEACTIVATED",                                         # 2
+    ),
 }
 
 
