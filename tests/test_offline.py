@@ -1455,6 +1455,37 @@ def test_login_4xx_without_callback_still_fails():
         client._finish_login(resp)  # pylint: disable=protected-access
 
 
+@pytest.mark.parametrize("url", [IDENTITY + "/signin-service/v1/x/login/authenticate", CALLBACK_URL])
+@pytest.mark.parametrize("status", [404, 500, 503])
+def test_login_identity_outage_is_not_a_credentials_failure(url, status):
+    """5xx/404 at the end of the chain is VW failing, not the password: still an
+    AuthError (keeps the login back-off) but saying so."""
+    client = _login_client()
+    with pytest.raises(AuthError, match=rf"identity service unavailable .*\(HTTP {status}\)") as excinfo:
+        client._finish_login(_FakeResp(url, status_code=status))  # pylint: disable=protected-access
+    assert "check email and password" not in str(excinfo.value)
+
+
+def test_login_rate_limit_honours_retry_after():
+    client = _login_client()
+    resp = _FakeResp(CALLBACK_URL, status_code=429, headers={"Retry-After": "120"})
+    with pytest.raises(TooManyRequestsError) as excinfo:
+        client._finish_login(resp)  # pylint: disable=protected-access
+    assert excinfo.value.retry_after == 120
+
+
+@pytest.mark.parametrize("status, error", [(503, AuthError), (404, AuthError), (429, TooManyRequestsError)])
+def test_login_sign_in_page_outage_is_reported_as_such(status, error):
+    """A failing sign-in page used to surface as "could not parse the sign-in
+    form" and never reached the identifier POST."""
+    client = _login_client({IDENTITY + "/oidc/v1/authorize": _FakeResp(IDENTITY + "/signin-service/v1/x/login",
+                                                                        status_code=status)})
+    client._session.post = lambda *a, **k: pytest.fail("identifier POST after a failed sign-in page")
+    with pytest.raises(error) as excinfo:
+        client.login()
+    assert "parse the sign-in form" not in str(excinfo.value)
+
+
 def test_login_bad_credentials_still_detected():
     """Bad credentials re-render the identity sign-in page (HTTP 200, URL still
     on signin-service): detection must be unchanged."""
