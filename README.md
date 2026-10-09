@@ -207,6 +207,7 @@ reading is missing.
 | `battery_state_report.charge_rate` (+ unit) | `charging.rate` (km/h or mph) | |
 | `…remaining_charging_time_complete` / `remaining_charging_time` | `charging.estimated_date_reached` | |
 | `settings.target_soc` | `charging.settings.target_level` (%) | |
+| `settings.auto_unlock_ac` | `charging.settings.auto_unlock` | on for `PERMANENT` and `ONCE`, off for `OFF` |
 | `plug_state` | `charging.connector.connection_state` | |
 | `external_power_supply_state` | `charging.connector.external_power` | |
 

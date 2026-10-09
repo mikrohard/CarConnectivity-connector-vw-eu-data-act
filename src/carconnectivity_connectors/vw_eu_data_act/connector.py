@@ -219,6 +219,7 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'charging_state_report.charge_type',
     'settings.target_soc',
     'settings.charge_mode_selection',
+    'settings.auto_unlock_ac',
     'car_captured_time',
     # Flat-format (eGolf) fields handled in _map_dataset.
     'mileage',
@@ -433,6 +434,22 @@ def _charge_mode(raw) -> "Optional[VWEudaChargeMode]":
     if token.startswith('CHARGE_MODE_SELECTION_'):
         token = token[len('CHARGE_MODE_SELECTION_'):]
     return _CHARGE_MODE_TOKENS.get(token, VWEudaChargeMode.UNKNOWN)
+
+
+def _auto_unlock(raw) -> Optional[bool]:
+    """Map ``settings.auto_unlock_ac`` to the core boolean ``auto_unlock``.
+
+    PERMANENT and ONCE (unlock after the next AC charge only) both mean the plug
+    is released when the coming charge ends, which is what the volkswagen
+    connector reports as "on". OFF is False; INVALID or an unknown value leaves
+    the attribute untouched.
+    """
+    if raw is None:
+        return None
+    token = str(raw).strip().upper()
+    if token.startswith('AUTO_UNLOCK_AC_'):
+        token = token[len('AUTO_UNLOCK_AC_'):]
+    return {'PERMANENT': True, 'ONCE': True, 'OFF': False}.get(token)
 
 
 def _charge_mode_flat(dataset) -> "Optional[VWEudaChargeMode]":
@@ -1243,6 +1260,11 @@ class Connector(BaseConnector):
         target_soc = dataset.value_of('settings.target_soc')
         if target_soc is not None:
             _stamp(vehicle.charging.settings.target_level, value=target_soc, measured=captured_at)
+
+        # Plug auto-unlock after AC charging - read-only here (no commands possible).
+        auto_unlock = _auto_unlock(dataset.value_of('settings.auto_unlock_ac'))
+        if auto_unlock is not None:
+            _stamp(vehicle.charging.settings.auto_unlock, value=auto_unlock, measured=captured_at)
 
         # Selected charge mode (charge_mode_selection). The dotted format carries a
         # single value; the flat/continuous format splits it into one boolean per
