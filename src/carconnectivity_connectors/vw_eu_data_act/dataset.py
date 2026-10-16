@@ -174,6 +174,11 @@ ENUM_MEMBERS: Dict[str, tuple] = {
         "AUTO_UNLOCK_AC_PERMANENT",                                            # 2
         "AUTO_UNLOCK_AC_ONCE",                                                 # 3
     ),
+    "setting.bcam_activation": (
+        "BCAM_ACTIVATION_INVALID",                                             # 0
+        "BCAM_ACTIVATION_ACTIVATED",                                           # 1
+        "BCAM_ACTIVATION_DEACTIVATED",                                         # 2
+    ),
 }
 
 
