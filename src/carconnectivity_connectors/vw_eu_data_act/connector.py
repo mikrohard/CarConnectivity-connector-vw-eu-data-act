@@ -97,6 +97,23 @@ CHARGE_STATE_MAPPING: "Dict[str, Charging.ChargingState]" = {
     'CHARGE_STATE_CHARGING_ERROR': Charging.ChargingState.ERROR,
 }
 
+# Flat/continuous-format charging_state labels, compared lower-cased. The data
+# dictionary lists invalid, unsupported, off, charging, completed, error and
+# conservationCharging; chargingHvBattery is not listed but is what a SEAT Leon
+# e-Hybrid sends while charging (issue #56). 'completed' follows the dotted
+# "charge purpose reached, no conservation" state. A label missing here is still
+# tried against the CarConnectivity enum values before falling back to UNKNOWN.
+FLAT_CHARGE_STATE_MAPPING: "Dict[str, Charging.ChargingState]" = {
+    'off': Charging.ChargingState.OFF,
+    'charging': Charging.ChargingState.CHARGING,
+    'charginghvbattery': Charging.ChargingState.CHARGING,
+    'conservationcharging': Charging.ChargingState.CONSERVATION,
+    'completed': Charging.ChargingState.OFF,
+    'error': Charging.ChargingState.ERROR,
+    'unsupported': Charging.ChargingState.UNSUPPORTED,
+    'invalid': Charging.ChargingState.UNKNOWN,
+}
+
 WINDOW_HEATING_MAPPING: "Dict[str, WindowHeatings.HeatingState]" = {
     'WINDOW_HEATING_STATE_OFF': WindowHeatings.HeatingState.OFF,
     'WINDOW_HEATING_STATE_ON': WindowHeatings.HeatingState.ON,
@@ -247,6 +264,8 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     'charge_mode_selection_options.immediate_discharging',
     'plug_state',
     'external_power_supply_state',
+    'charging_plug1_connectionstate', 'charging_plug1_lock_state',
+    'charging_plug2_connectionstate', 'charging_plug2_lock_state',
     'remaining_charging_time',
     'charging_power',
     'actual_charge_rate',
@@ -450,6 +469,37 @@ def _charge_mode_flat(dataset) -> "Optional[VWEudaChargeMode]":
         if active:
             return mode
     return None
+
+
+_PLUG_CONNECTION = {
+    'connected': ChargingConnector.ChargingConnectorConnectionState.CONNECTED,
+    'disconnected': ChargingConnector.ChargingConnectorConnectionState.DISCONNECTED,
+}
+_PLUG_LOCK = {
+    'locked': ChargingConnector.ChargingConnectorLockState.LOCKED,
+    'unlocked': ChargingConnector.ChargingConnectorLockState.UNLOCKED,
+}
+
+
+def _flat_plug_states(dataset) -> "Tuple[Optional[ChargingConnector.ChargingConnectorConnectionState], Optional[ChargingConnector.ChargingConnectorLockState]]":
+    """Connection and lock state from the per-plug flat fields.
+
+    A car may report two plugs, one of them absent (lock ``invalid``, flap
+    ``unavailable`` on a SEAT Leon e-Hybrid), so neither plug is trusted on its
+    own: the car counts as connected when either plug is, and the lock state is
+    taken from the connected plug first. ``invalid`` / ``unavailable`` and any
+    other label are treated as no value.
+    """
+    plugs = []
+    for number in (1, 2):
+        connection = dataset.value_of(f'charging_plug{number}_connectionstate')
+        lock = dataset.value_of(f'charging_plug{number}_lock_state')
+        plugs.append((str(connection).strip().lower() if connection is not None else None,
+                      str(lock).strip().lower() if lock is not None else None))
+    plugs.sort(key=lambda plug: plug[0] != 'connected')
+    connection_state = next((_PLUG_CONNECTION[c] for c, _ in plugs if c in _PLUG_CONNECTION), None)
+    lock_state = next((_PLUG_LOCK[lock] for _, lock in plugs if lock in _PLUG_LOCK), None)
+    return connection_state, lock_state
 
 
 def _light_code(value) -> "Optional[str]":
@@ -1268,10 +1318,13 @@ class Connector(BaseConnector):
         # variants are absent. Their values match the CarConnectivity enum values.
         flat_state = dataset.value_of('charging_state')
         if isinstance(flat_state, str) and charge_state is None:
-            try:
-                state_enum = Charging.ChargingState(flat_state.strip().lower())
-            except ValueError:
-                state_enum = Charging.ChargingState.UNKNOWN
+            label = flat_state.strip().lower()
+            state_enum = FLAT_CHARGE_STATE_MAPPING.get(label)
+            if state_enum is None:
+                try:
+                    state_enum = Charging.ChargingState(label)
+                except ValueError:
+                    state_enum = Charging.ChargingState.UNKNOWN
             _stamp(vehicle.charging.state, state_enum, measured=captured_at)
 
         flat_mode = dataset.value_of('charging_mode')
@@ -1305,6 +1358,14 @@ class Connector(BaseConnector):
                     ChargingConnector.ChargingConnectorConnectionState(plug.strip().lower()), measured=captured_at)
             except ValueError:
                 pass
+
+        # Per-plug flat fields (charging_plug1_* / charging_plug2_*), sent instead
+        # of plug_state by some PHEVs (SEAT Leon e-Hybrid, issue #56).
+        plug_connection, plug_lock = _flat_plug_states(dataset)
+        if plug_connection is not None and not isinstance(plug, str):
+            _stamp(vehicle.charging.connector.connection_state, plug_connection, measured=captured_at)
+        if plug_lock is not None:
+            _stamp(vehicle.charging.connector.lock_state, plug_lock, measured=captured_at)
 
         ext_power = dataset.value_of('external_power_supply_state')
         if isinstance(ext_power, str):

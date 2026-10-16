@@ -1,0 +1,612 @@
+{
+  "vin": "VSSZZZKL7XXXXXXXX",
+  "user_id": "<redacted>",
+  "Data": [
+    {
+      "key": "b871c390-5325-377d-a91f-ea09bc0eff92",
+      "dataFieldName": "outsideTemperatureIndication",
+      "value": "22",
+      "timestampUtc": "2026-10-13T17:23:12.457Z"
+    },
+    {
+      "key": "c5b624db-6a07-3957-9127-98cee0be6c98",
+      "dataFieldName": "boardnetBatteryVoltageIndication",
+      "value": "13.65",
+      "timestampUtc": "2026-10-13T17:27:12.607Z"
+    },
+    {
+      "key": "unresolved-inspectionDistance",
+      "dataFieldName": "inspectionDistance",
+      "value": "11800",
+      "timestampUtc": "2026-10-13T17:27:11.730Z"
+    },
+    {
+      "key": "d5e199c6-cdd5-31c3-b3d1-915c78662521",
+      "dataFieldName": "safe_state_rear_left_door",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "8a1a81d1-eddc-31ee-94b1-36f8228193fb",
+      "dataFieldName": "charge_time_display",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "41c0805c-43e5-313e-9dfb-356cb8d20f7c",
+      "dataFieldName": "mileage",
+      "value": "18250",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "8ab83a99-d382-3ce1-9470-d98612e85066",
+      "dataFieldName": "tyre_pressure_required_front_right",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "a3368611-8c63-3b7d-9d19-148a464c7a7b",
+      "dataFieldName": "oil_level_actual_level",
+      "value": "75.0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "9da735bb-c5d5-39f8-bf53-0fa2a367aa8f",
+      "dataFieldName": "charging_state",
+      "value": "chargingHvBattery",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "5fb120bb-ab59-38fc-8e03-9ae197c7a1ae",
+      "dataFieldName": "state_rear_left_door_window_lifter",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "1920d136-854f-3a0c-905a-1dcbdfc955bd",
+      "dataFieldName": "charging_scenario",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "a59fa6dd-c0e8-35af-afc0-1f411c33c78c",
+      "dataFieldName": "tyre_pressure_differential_rear_left",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "d7d35c0a-706c-3f28-a61a-c3b002116a25",
+      "dataFieldName": "tyre_pressure_differential_rear_right",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "1e4d13b5-ce70-3429-a545-796f40775f92",
+      "dataFieldName": "tyre_pressure_required_front_left",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "937bf8d6-bd3e-306e-af30-8a8a4cc14644",
+      "dataFieldName": "locked_state_front_engine_bonnet",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "3ef13c1d-7e08-3cf4-b501-a8bda80cff78",
+      "dataFieldName": "state_rear_right_door_window_lifter",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "f4cca318-8c7d-3a5e-a2af-04559e298e68",
+      "dataFieldName": "charge_rate_unit",
+      "value": "km_per_h",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "4fd43a40-7cb4-32c4-bb6b-9b59a2a82975",
+      "dataFieldName": "setting_mirror_heating_enabled",
+      "value": "false",
+      "timestampUtc": "2026-10-13T17:27:10.000Z"
+    },
+    {
+      "key": "unresolved-cycle_data_mileage",
+      "dataFieldName": "cycle_data_mileage",
+      "value": "1065",
+      "timestampUtc": "2026-10-13T17:27:10.000Z"
+    },
+    {
+      "key": "db1eb937-aac2-305f-a43a-f35d61033b67",
+      "dataFieldName": "charging_plug2_lock_state",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "1503760b-5570-3001-8ffc-1bb6f464948e",
+      "dataFieldName": "fuel_level_current_level",
+      "value": "42",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "78e92351-cf56-3c15-96d3-9b63d62ca618",
+      "dataFieldName": "oil_level_additional_oil_level",
+      "value": "75.0",
+      "timestampUtc": "2026-10-13T17:27:50.000Z"
+    },
+    {
+      "key": "unresolved-climatisation_state_error_code",
+      "dataFieldName": "climatisation_state_error_code",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:27:10.000Z"
+    },
+    {
+      "key": "eb33ae12-1481-36e5-b228-c74fa5478eb5",
+      "dataFieldName": "charging_plug1_flap_lock_state",
+      "value": "unlocked",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "968057df-7916-3079-b2f8-01c35da6da7f",
+      "dataFieldName": "active_target_soc",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "8d4cb2b4-a4f5-3285-9cc4-fc6709ada6fd",
+      "dataFieldName": "oil_level_total_max",
+      "value": "1.0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "0543e58f-cd49-3e63-9e00-3b2d27043a25",
+      "dataFieldName": "position_rear_left_door_window_lifter",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "95380872-847c-39d7-857f-17cdea1579ce",
+      "dataFieldName": "locked_state_tailgate",
+      "value": "2",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "0bb971a6-12ef-3382-9b99-5ed0a52f18e9",
+      "dataFieldName": "open_state_front_right_door",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "0f43f2e7-3556-36a9-8271-a60bc54afad8",
+      "dataFieldName": "echo",
+      "value": "echo",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "fcbbc9c5-d302-3019-a293-07a0123e3f53",
+      "dataFieldName": "tyre_pressure_required_rear_right",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "7e35b2a4-8f31-30a7-848d-3af7bb1c5e55",
+      "dataFieldName": "fuel_level__accuracy",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "69729e19-7b1a-3189-8e11-b4b31ab7601a",
+      "dataFieldName": "tyre_pressure_differential_front_left",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "42b1c47b-e1d1-375f-a76f-32ab0177f03e",
+      "dataFieldName": "maintenance_interval__time_until_oil_change",
+      "value": "-226",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "60fddd42-f4fe-3382-ba31-f04ce52d2ab4",
+      "dataFieldName": "position_front_left_door_window_lifter",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "ae0294b4-1286-3e98-a818-1485b8d88430",
+      "dataFieldName": "state_of_charge",
+      "value": "32",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "9ea413f5-ee6c-3f28-b7a3-65ed6d9757ef",
+      "dataFieldName": "profile_charge_reason",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "920f460c-123e-3088-8d36-ba349b11f399",
+      "dataFieldName": "window_heating_state_rear",
+      "value": "off",
+      "timestampUtc": "2026-10-13T17:27:10.000Z"
+    },
+    {
+      "key": "33d2c35b-8aac-3509-bb88-807682055b1b",
+      "dataFieldName": "tyre_pressure_actual_rear_left",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "bc9bbc65-8461-30eb-88db-f94148552a20",
+      "dataFieldName": "open_state_front_left_door",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "be03dca4-16fb-3072-82bd-17064bd423b9",
+      "dataFieldName": "tyre_pressure_actual_front_right",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "60c81e02-4825-3aab-8da8-b8b07f251623",
+      "dataFieldName": "open_state_rear_right_door",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "b38e35e9-b2e9-38ce-9b14-27e6066ab888",
+      "dataFieldName": "state_service_hatch",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "ac86e00b-7fa1-3a59-b481-aa7cfc49b0d9",
+      "dataFieldName": "maintenance_interval_distance_until_inspection",
+      "value": "-11800",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "173589ce-e437-3c6e-a0ec-6df704586fd7",
+      "dataFieldName": "trueness",
+      "value": null,
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "5f913493-351d-3aa8-a1c5-20506d9d7f9a",
+      "dataFieldName": "tyre_pressure_actual_rear_right",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "5497c6f9-d22e-3bfc-886e-d1279a6be410",
+      "dataFieldName": "tyre_pressure_required_rear_left",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "e1c6d420-b439-3de6-a5b7-d0b474cc2752",
+      "dataFieldName": "open_state_front_engine_bonnet",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "33bf521d-b194-3b38-97c3-1b63727676d1",
+      "dataFieldName": "charging_plug1_flap_state",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "37d8c0c0-9677-3823-8b32-d0a5001cb0d0",
+      "dataFieldName": "charging_plug1_connectionstate",
+      "value": "connected",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "fc0dab76-59ca-31bd-8845-e4b39d485b71",
+      "dataFieldName": "locked_state__rear_left_door",
+      "value": "2",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "60a4f436-5534-32f4-b4cc-b5a88a9d4b91",
+      "dataFieldName": "state_front_left_door_window_lifter",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "7e50ef29-05bc-36c3-8e31-d51ee67f7eb7",
+      "dataFieldName": "charging_plug2_flap_state",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "3611b9e7-c6f3-39ef-b700-1f650dde7979",
+      "dataFieldName": "safe_state_front_right_door",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "a8bd75f4-e8d2-3c8b-973d-b2d15d9a1d46",
+      "dataFieldName": "state_sunroof_motor_hood_3",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "db6919e8-430a-35dc-a930-14d289be6985",
+      "dataFieldName": "locked_state_front_left_door",
+      "value": "2",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "370c2092-d983-38e4-861f-91482b7cff54",
+      "dataFieldName": "actual_charge_rate",
+      "value": "90",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "90bf5833-6b80-3517-8b6b-6eee0abc1076",
+      "dataFieldName": "setting_climatisation_at_unlock",
+      "value": "false",
+      "timestampUtc": "2026-10-13T17:27:10.000Z"
+    },
+    {
+      "key": "cd4aec42-7620-38bc-a285-92626ca7cc91",
+      "dataFieldName": "charging_plug2_flap_lock_state",
+      "value": "unavailable",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "55e0d40b-38ed-3cb5-9dcd-6193df6fc493",
+      "dataFieldName": "cruising_range_primary_engine",
+      "value": "240",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "92346806-a547-3014-b291-476c90558e53",
+      "dataFieldName": "safe_state_tailgate",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "d9f36adc-1840-37da-8ca1-7c2d789bcf9e",
+      "dataFieldName": "maintenance_interval_distance_until_oil_change",
+      "value": "-11800",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "fd600221-7965-3396-96d7-82a840a2831c",
+      "dataFieldName": "maintenance_interval__time_until_inspection",
+      "value": "-226",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "6b720620-2e64-3e49-aab5-80858d8e05fd",
+      "dataFieldName": "start_stop_modification",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "c046a189-1068-3f8a-b00b-8bc4b9b4c6e0",
+      "dataFieldName": "tyre_pressure_required_spare_tyre",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "57cb3a0e-e9f1-32d1-bf19-dd5970230699",
+      "dataFieldName": "position_front_right_door_window_lifter",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "053496dc-0a8e-3e0c-93fd-055e622d3f99",
+      "dataFieldName": "bem_level",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "940aad2a-eb21-3e5c-b0c6-8ff4b395f917",
+      "dataFieldName": "safe_state_front_engine_bonnet",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "5fcf7d27-6b76-3de0-9ce9-f207370cdaff",
+      "dataFieldName": "state_front_right_door_window_lifter",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "d3ada06c-3910-34f5-bb98-3e5813bbe8da",
+      "dataFieldName": "charging_plug2_connectionstate",
+      "value": "disconnected",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "c17ead4f-09b8-357f-ac2b-38c448ab88c4",
+      "dataFieldName": "parking_lights",
+      "value": "2",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "c4a26fd6-c08f-3921-bb8c-23fab6751c54",
+      "dataFieldName": "tyre_pressure_actual_front_left",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "6810b781-e54a-35e8-af98-fcdefb54bac6",
+      "dataFieldName": "outside_temperature",
+      "value": "2941",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "978be4ed-2f7f-32c0-8644-18e7b0dde741",
+      "dataFieldName": "charging_power",
+      "value": "17",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "cff28415-8084-34e0-ad91-db191e5ff3b6",
+      "dataFieldName": "state_sunroof_motor_hood_1",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "97c7b448-13e7-3266-a6be-7487caf1a354",
+      "dataFieldName": "charging_mode",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "3dedefab-8ded-3f5a-907f-d5e9970720bf",
+      "dataFieldName": "cruising_range_secondary_engine",
+      "value": "34",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "dbb8f3b1-2bc9-3afc-a1d5-61f1eb04d1c4",
+      "dataFieldName": "open_state_tailgate",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "1416247c-df11-3685-b839-65d87cf97bcb",
+      "dataFieldName": "safe_state_rear_right_door",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "2e6b0c49-6e9c-33ae-b83b-a9920c48c0b3",
+      "dataFieldName": "charging_plug2_infrastructure_state",
+      "value": "active",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "9f020a2c-f4d8-380f-8afb-77ee9fc9e4d3",
+      "dataFieldName": "charging_plug1_lock_state",
+      "value": "locked",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "a86e735b-5f04-336a-8dc7-8fb189d02cd2",
+      "dataFieldName": "tyre_pressure_differential_front_right",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "21e084ad-51bf-3461-a521-49a544720c91",
+      "dataFieldName": "locked_state_front_right_door",
+      "value": "2",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "cf28f7d9-6201-30b8-82e5-a461968d30dc",
+      "dataFieldName": "remaining_charging_time",
+      "value": "420",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "d48ccd21-a39f-33eb-989b-d81bd23fa766",
+      "dataFieldName": "state_of_hood",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "2efcd0ec-6188-3fbc-a455-8dabe4df3b2b",
+      "dataFieldName": "charging_plug1_infrastructure_state",
+      "value": "active",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "f8bbe94d-06e1-3311-bf8f-c0c99cc67d48",
+      "dataFieldName": "parking_brake",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "1c62bf0a-8088-332c-9399-3b8cb0573099",
+      "dataFieldName": "remaining_climatisation_time",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:27:10.000Z"
+    },
+    {
+      "key": "153e8c40-4c6c-3c17-a11b-0ecc35d55b81",
+      "dataFieldName": "cruising_range_combined",
+      "value": "274",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "b43ff74c-2505-3a38-bf98-78c817fbaf96",
+      "dataFieldName": "scr_range",
+      "value": "",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "351e9e10-b831-391e-9fc4-ccacc8cd3eba",
+      "dataFieldName": "tyre_pressure_differential_spare_tyre",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "1403559a-d939-3ec2-96c6-c2e8e6d0bd13",
+      "dataFieldName": "tyre_pressure_actual_spare_tyre",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "bf62dd10-b184-3425-a64c-c50b09420bc3",
+      "dataFieldName": "open_state_rear_left_door",
+      "value": "3",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "78fdf808-7917-335f-a44b-f4ad582f98bc",
+      "dataFieldName": "oil_level_dipstick_indicator_function",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "unresolved-climatisation_state",
+      "dataFieldName": "climatisation_state",
+      "value": "off",
+      "timestampUtc": "2026-10-13T17:27:10.000Z"
+    },
+    {
+      "key": "0bf3d84a-9164-3d1c-8191-ca6dbce848a7",
+      "dataFieldName": "position_rear_right_door_window_lifter",
+      "value": "0",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "4ae5b58c-46e2-3ec2-bf00-f6a05ef498d2",
+      "dataFieldName": "start_stop_action",
+      "value": "invalid",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "b4d5d426-faea-37fd-8274-8fd4a386e535",
+      "dataFieldName": "charge_mode",
+      "value": "immediatelyProfile",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "6e36232f-4c55-3688-9948-a3a6ae056db1",
+      "dataFieldName": "locked_state_rear_right_door",
+      "value": "2",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    },
+    {
+      "key": "acdd25b5-8d20-3dbc-83f7-e5b8436e0362",
+      "dataFieldName": "last_battery_charger_update_trigger",
+      "value": "other",
+      "timestampUtc": "2026-10-13T22:30:15.000Z"
+    },
+    {
+      "key": "6d90f88e-b7bf-3b1e-a306-c0e1c0c29c6e",
+      "dataFieldName": "state_spoiler",
+      "value": "1",
+      "timestampUtc": "2026-10-13T17:46:44.000Z"
+    }
+  ]
+}
