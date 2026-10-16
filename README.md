@@ -203,7 +203,7 @@ reading is missing.
 | EU Data Act field | CarConnectivity attribute | Notes |
 |---|---|---|
 | `battery_state_report.charge_power` | `charging.power` (kW) | |
-| `charging_state_report.current_charge_state` / `charging_state` | `charging.state` | |
+| `charging_state_report.current_charge_state` / `charging_state` | `charging.state` | flat labels such as `chargingHvBattery`, `conservationCharging`, `completed` translated |
 | `charging_state_report.charge_type` / `charging_mode` | `charging.type` (AC / DC / off) | |
 | `battery_state_report.charge_rate` (+ unit) | `charging.rate` (km/h or mph) | |
 | `…remaining_charging_time_complete` / `remaining_charging_time` | `charging.estimated_date_reached` | |
@@ -211,6 +211,8 @@ reading is missing.
 | `settings.auto_unlock_ac` | `charging.settings.auto_unlock` | on for `PERMANENT` and `ONCE`, off for `OFF` |
 | `setting.bcam_activation` | `charging.settings.battery_care_mode` | connector attribute (tag `connector_custom`), not in the core model |
 | `plug_state` | `charging.connector.connection_state` | |
+| `charging_plug1_connectionstate` / `charging_plug2_connectionstate` | `charging.connector.connection_state` | when `plug_state` is absent; connected if either plug is |
+| `charging_plug1_lock_state` / `charging_plug2_lock_state` | `charging.connector.lock_state` | connected plug first; `invalid` ignored |
 | `external_power_supply_state` | `charging.connector.external_power` | |
 
 ## Not exposed (and why)

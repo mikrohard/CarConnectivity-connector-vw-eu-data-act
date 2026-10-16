@@ -15,6 +15,7 @@ import pytest
 
 from carconnectivity.carconnectivity import CarConnectivity
 from carconnectivity.charging import Charging
+from carconnectivity.charging_connector import ChargingConnector
 from carconnectivity.doors import Doors
 from carconnectivity.errors import TooManyRequestsError
 from carconnectivity.observable import Observable
@@ -2394,3 +2395,102 @@ def test_measured_falls_back_to_created_on_never_none(connector):
     connector._map_dataset(VIN, ds, created)  # pylint: disable=protected-access
     vehicle = garage.get_vehicle(VIN)
     assert vehicle.odometer.last_updated == created
+
+
+LEON_EHYBRID_SAMPLE = os.path.join(os.path.dirname(__file__), "leon_ehybrid_charging_sample_dataset.json")
+
+
+def _flat_ev_dataset(*fields) -> Dataset:
+    data = [{"key": "k0", "dataFieldName": "state_of_charge", "value": "50"}]
+    data += [{"key": f"k{i}", "dataFieldName": name, "value": value}
+             for i, (name, value) in enumerate(fields, start=1)]
+    return Dataset.from_json({"vin": VIN, "Data": data})
+
+
+@pytest.mark.parametrize("label, expected", [
+    ("chargingHvBattery", Charging.ChargingState.CHARGING),
+    ("charging", Charging.ChargingState.CHARGING),
+    ("conservationCharging", Charging.ChargingState.CONSERVATION),
+    ("completed", Charging.ChargingState.OFF),
+    ("off", Charging.ChargingState.OFF),
+    ("error", Charging.ChargingState.ERROR),
+    ("unsupported", Charging.ChargingState.UNSUPPORTED),
+    ("invalid", Charging.ChargingState.UNKNOWN),
+    ("discharging", Charging.ChargingState.DISCHARGING),
+    ("somethingNew", Charging.ChargingState.UNKNOWN),
+])
+def test_flat_charging_state_labels(connector, label, expected):
+    """Issue #56: camelCase flat labels went through the enum constructor after
+    lower-casing and all fell back to UNKNOWN. Dictionary labels plus the observed
+    chargingHvBattery now map; other enum values and unknown labels behave as before."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, _flat_ev_dataset(("charging_state", label)))  # pylint: disable=protected-access
+    assert garage.get_vehicle(VIN).charging.state.value == expected
+
+
+@pytest.mark.parametrize("plug1, plug2, connection, lock", [
+    # Leon e-Hybrid while charging: plug 2 does not exist on the car.
+    (("connected", "locked"), ("disconnected", "invalid"),
+     ChargingConnector.ChargingConnectorConnectionState.CONNECTED, ChargingConnector.ChargingConnectorLockState.LOCKED),
+    # The connected plug wins, whichever it is, and so does its lock.
+    (("disconnected", "unlocked"), ("connected", "locked"),
+     ChargingConnector.ChargingConnectorConnectionState.CONNECTED, ChargingConnector.ChargingConnectorLockState.LOCKED),
+    (("disconnected", "unlocked"), ("disconnected", "invalid"),
+     ChargingConnector.ChargingConnectorConnectionState.DISCONNECTED, ChargingConnector.ChargingConnectorLockState.UNLOCKED),
+    # invalid / unavailable carry no value.
+    (("invalid", "unavailable"), ("invalid", "invalid"), None, None),
+])
+def test_flat_per_plug_fields(connector, plug1, plug2, connection, lock):
+    """Issue #56: charging_plug1_* / charging_plug2_* feed the connector state
+    when plug_state is absent; either plug being connected counts."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, _flat_ev_dataset(  # pylint: disable=protected-access
+        ("charging_plug1_connectionstate", plug1[0]), ("charging_plug1_lock_state", plug1[1]),
+        ("charging_plug2_connectionstate", plug2[0]), ("charging_plug2_lock_state", plug2[1])))
+    charging_connector = garage.get_vehicle(VIN).charging.connector
+    assert charging_connector.connection_state.value == connection
+    assert charging_connector.lock_state.value == lock
+
+
+def test_plug_state_takes_precedence_over_per_plug_fields(connector):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, _flat_ev_dataset(  # pylint: disable=protected-access
+        ("plug_state", "disconnected"), ("charging_plug1_connectionstate", "connected")))
+    assert garage.get_vehicle(VIN).charging.connector.connection_state.value \
+        == ChargingConnector.ChargingConnectorConnectionState.DISCONNECTED
+
+
+def test_leon_ehybrid_charging_export(connector):
+    """End-to-end on the SEAT Leon e-Hybrid export from issue #56, taken during
+    an AC charge. Keys were dropped by the reporter; the fixture carries the
+    dictionary keys where known and an 'unresolved-' placeholder otherwise."""
+    from carconnectivity.vehicle import HybridVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    with open(LEON_EHYBRID_SAMPLE, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    payload["vin"] = VIN
+    connector._map_dataset(VIN, Dataset.from_json(payload))  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert isinstance(v, HybridVehicle)
+    assert v.charging.state.value == Charging.ChargingState.CHARGING
+    assert v.charging.connector.connection_state.value == ChargingConnector.ChargingConnectorConnectionState.CONNECTED
+    assert v.charging.connector.lock_state.value == ChargingConnector.ChargingConnectorLockState.LOCKED
+    # Unchanged by the fix, already correct in the report.
+    assert v.charging.type.value == Charging.ChargingType.INVALID
+    assert v.charging.power.value == 1.7
+    assert v.charging.rate.value == 9.0
+    assert v.charging.estimated_date_reached.value == datetime(2026, 10, 14, 5, 30, 15, tzinfo=timezone.utc)
+
+
+def test_leon_ehybrid_plug_fields_not_flagged_unmapped(caplog):
+    with open(LEON_EHYBRID_SAMPLE, "r", encoding="utf-8") as fh:
+        ds = Dataset.from_json(json.load(fh))
+    with caplog.at_level(logging.INFO, logger="carconnectivity.connectors.vw_eu_data_act"):
+        Connector._detect_unmapped_fields(VIN, ds)  # pylint: disable=protected-access
+    assert "charging_plug1_connectionstate" not in caplog.text
+    assert "charging_plug1_lock_state" not in caplog.text
