@@ -128,6 +128,34 @@ def test_flat_data_multiple_fields_mapped(connector):
     assert v.charging.settings.target_level.value == 80
 
 
+@pytest.mark.parametrize("raw, expected", [
+    ("AUTO_UNLOCK_AC_PERMANENT", True),
+    ("AUTO_UNLOCK_AC_ONCE", True),
+    ("AUTO_UNLOCK_AC_OFF", False),
+    ("2", True),  # raw protobuf enum index of PERMANENT
+    ("AUTO_UNLOCK_AC_INVALID", None),
+    ("AUTO_UNLOCK_AC_SOMETHING_NEW", None),
+])
+def test_auto_unlock_maps_to_charging_settings(connector, raw, expected):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "2d7b0796-dc72-343d-b69f-4789bc0fcff2", "dataFieldName": "settings.auto_unlock_ac", "value": raw},
+    ]}))
+
+    assert garage.get_vehicle(VIN).charging.settings.auto_unlock.value is expected
+
+
+def test_auto_unlock_from_real_id4_export(connector):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+
+    connector._map_dataset(VIN, _load_id4())  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).charging.settings.auto_unlock.value is True
+
+
 def test_flat_data_enum_mapping(connector):
     garage = connector.car_connectivity.garage
     vehicle = VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector)
