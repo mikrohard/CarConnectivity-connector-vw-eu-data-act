@@ -25,6 +25,7 @@ import requests
 
 from carconnectivity.units import Energy, Length, Speed
 
+from carconnectivity_connectors.vw_eu_data_act.brands import BRANDS
 from carconnectivity_connectors.vw_eu_data_act.client import ApiError, AuthError, EudaApiClient
 from carconnectivity_connectors.vw_eu_data_act.connector import (
     Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS,
@@ -1440,10 +1441,10 @@ def _callback_resp(cookies=None):
                      cookies={"access_token": "tok"} if cookies is None else cookies)
 
 
-def _login_client(routes=None, accept=False):
+def _login_client(routes=None, accept=False, brand="VOLKSWAGEN_PASSENGER_CARS"):
     """Client whose GETs are answered from ``routes`` (url without query ->
     response) and recorded, so tests can assert what was (not) fetched."""
-    client = EudaApiClient(email="u", password="p", accept_terms_on_login=accept)
+    client = EudaApiClient(email="u", password="p", accept_terms_on_login=accept, brand=brand)
     client.gets = []
 
     def _get(url, **kwargs):
@@ -1634,11 +1635,13 @@ csrf_token: 'c2' };</script>
 <form action="/signin-service/v1/x/login/authenticate"></form>"""
 
 
-def test_full_login_flow_follows_vw_requirements():
+@pytest.mark.parametrize("brand", sorted(BRANDS))
+def test_full_login_flow_follows_vw_requirements(brand):
     """End to end: no priming GET of the portal home page, credentials POSTed
     without automatic redirects, and the login ends on the callback without
-    fetching the CMS page or probing the API."""
-    client = _login_client({
+    fetching the CMS page or probing the API. The flow follows the page, not
+    the brand."""
+    client = _login_client(brand=brand, routes={
         IDENTITY + "/oidc/v1/authorize": _FakeResp(IDENTITY + "/signin-service/v1/x/login", text=SIGNIN_HTML),
         PORTAL + "/services/callbacklogin": _callback_resp(),
     })
@@ -1656,10 +1659,184 @@ def test_full_login_flow_follows_vw_requirements():
 
     fetched = [url.split("?", 1)[0] for url, _ in client.gets]
     assert fetched == [IDENTITY + "/oidc/v1/authorize", PORTAL + "/services/callbacklogin"]
+    assert posts[0][0] == IDENTITY + "/signin-service/v1/x/login/identifier"
+    assert posts[0][1]["email"] == "u" and "password" not in posts[0][1]
     assert posts[1][0] == IDENTITY + "/signin-service/v1/x/login/authenticate"
     assert posts[1][1]["password"] == "p"
     assert posts[1][2]["allow_redirects"] is False
     assert client._logged_in  # pylint: disable=protected-access
+
+
+AUTH0_LOGIN_URL = IDENTITY + "/u/login?state=s1"
+AUTH0_SIGNIN_HTML = """<form method="POST" class="c-form">
+<input type="hidden" name="state" value="s1">
+<input type="text" name="username" value=""><input type="password" name="password">
+<button type="submit" name="action" value="default">Continue</button></form>"""
+
+
+@pytest.mark.parametrize("brand", sorted(BRANDS))
+def test_full_login_flow_auth0_universal_login(brand):
+    """Auth0 Universal Login (Oct 2026, issue #60): a single POST of
+    state/username/password back to the /u/login URL, then the usual manual
+    redirect chain (/authorize/resume, OIDC callback) to the portal. Whatever
+    the brand: VW moves brands to Auth0 one at a time."""
+    resume = IDENTITY + "/authorize/resume"
+    identity_callback = IDENTITY + "/oidc/v1/oauth/client/callback"
+    client = _login_client(brand=brand, routes={
+        IDENTITY + "/oidc/v1/authorize": _FakeResp(AUTH0_LOGIN_URL, text=AUTH0_SIGNIN_HTML),
+        resume: _redirect(resume + "?state=s1", identity_callback + "?code=y"),
+        identity_callback: _redirect(identity_callback + "?code=y", CALLBACK_URL),
+        PORTAL + "/services/callbacklogin": _callback_resp(),
+    })
+    posts = []
+
+    def _post(url, data=None, **kwargs):
+        posts.append((url, data, kwargs))
+        return _redirect(url, "/authorize/resume?state=s1")
+
+    client._session.post = _post
+    client.login()
+
+    assert len(posts) == 1
+    url, data, kwargs = posts[0]
+    assert url == AUTH0_LOGIN_URL
+    assert data == {"state": "s1", "username": "u", "password": "p"}
+    assert kwargs["allow_redirects"] is False
+    assert [u.split("?", 1)[0] for u, _ in client.gets] == [
+        IDENTITY + "/oidc/v1/authorize", resume, identity_callback, PORTAL + "/services/callbacklogin"]
+    assert client._logged_in  # pylint: disable=protected-access
+
+
+def test_login_auth0_split_identifier_and_password_pages():
+    """Auth0 can also ask for the identifier and the password on two pages
+    (/u/login/identifier, then /u/login/password): each form gets what it asks
+    for, the password only on the password page."""
+    identifier_url = IDENTITY + "/u/login/identifier?state=s1"
+    password_url = IDENTITY + "/u/login/password?state=s2"
+    client = _login_client({
+        IDENTITY + "/oidc/v1/authorize": _FakeResp(identifier_url, text=(
+            '<form method="POST"><input type="hidden" name="state" value="s1">'
+            '<input name="username"></form>')),
+        IDENTITY + "/u/login/password": _FakeResp(password_url, text=(
+            '<form method="POST"><input type="hidden" name="state" value="s2">'
+            '<input type="hidden" name="username" value="u"><input type="password" name="password"></form>')),
+        PORTAL + "/services/callbacklogin": _callback_resp(),
+    })
+    posts = []
+
+    def _post(url, data=None, **kwargs):
+        posts.append((url, data))
+        if url == identifier_url:
+            return _redirect(url, "/u/login/password?state=s2")
+        return _redirect(url, CALLBACK_URL)
+
+    client._session.post = _post
+    client.login()
+
+    assert posts == [(identifier_url, {"state": "s1", "username": "u"}),
+                     (password_url, {"state": "s2", "username": "u", "password": "p"})]
+    assert client._logged_in  # pylint: disable=protected-access
+
+
+def test_login_bad_password_is_sent_once():
+    """A re-rendered Auth0 form after the password POST is a credentials
+    failure: reported as such, and the password is never POSTed again."""
+    client = _login_client({IDENTITY + "/oidc/v1/authorize": _FakeResp(AUTH0_LOGIN_URL, text=AUTH0_SIGNIN_HTML)})
+    posts = []
+
+    def _post(url, data=None, **kwargs):
+        posts.append(url)
+        return _FakeResp(AUTH0_LOGIN_URL, status_code=400, text=AUTH0_SIGNIN_HTML)
+
+    client._session.post = _post
+    with pytest.raises(AuthError, match="check email and password"):
+        client.login()
+    assert posts == [AUTH0_LOGIN_URL]
+
+
+def test_login_unknown_email_is_not_reposted():
+    """signin-service re-rendering the identifier page after the email POST
+    means the email was not taken: stop, do not POST it again."""
+    client = _login_client({IDENTITY + "/oidc/v1/authorize": _FakeResp(IDENTITY + "/signin-service/v1/x/login",
+                                                                        text=SIGNIN_HTML)})
+    posts = []
+
+    def _post(url, data=None, **kwargs):
+        posts.append(url)
+        return _FakeResp(IDENTITY + "/signin-service/v1/x/login", text=SIGNIN_HTML)
+
+    client._session.post = _post
+    with pytest.raises(AuthError, match="check the email address"):
+        client.login()
+    assert len(posts) == 1
+
+
+REGISTER_HTML = """<script>window._IDK = { templateModel: {"template": "registerCredentials", "hmac": "h3",
+"relayState": "r3"}, csrf_token: 'c3' };</script>
+<form action="/signin-service/v1/x/register"><input name="email"><input name="password"></form>"""
+
+
+@pytest.mark.parametrize("next_url, next_html", [
+    # signin-service sends an unknown email to its registration page (seen live
+    # 2026-11-01): it asks for an email and a password too
+    (IDENTITY + "/signin-service/v1/x/register", REGISTER_HTML),
+    (IDENTITY + "/u/signup?state=s1", '<form><input name="state" value="s1"><input name="email">'
+                                     '<input name="password"></form>'),
+])
+def test_login_never_posts_credentials_to_a_registration_page(next_url, next_html):
+    """An unknown email lands on an account creation page: it is reported as
+    such and nothing is POSTed to it."""
+    client = _login_client({
+        IDENTITY + "/oidc/v1/authorize": _FakeResp(IDENTITY + "/signin-service/v1/x/login", text=SIGNIN_HTML),
+        next_url.split("?", 1)[0]: _FakeResp(next_url, text=next_html),
+    })
+    posts = []
+
+    def _post(url, data=None, **kwargs):
+        posts.append(url)
+        return _redirect(url, next_url)
+
+    client._session.post = _post
+    with pytest.raises(AuthError, match="check the email address"):
+        client.login()
+    assert posts == [IDENTITY + "/signin-service/v1/x/login/identifier"]
+
+
+def test_login_form_posting_elsewhere_is_refused():
+    """Credentials are only ever POSTed over https to the identity host."""
+    client = _login_client({IDENTITY + "/oidc/v1/authorize": _FakeResp(AUTH0_LOGIN_URL, text=(
+        '<form action="https://attacker.example/u/login"><input name="username"><input name="password"></form>'))})
+    client._session.post = lambda *a, **k: pytest.fail("credentials POSTed off the identity host")
+    with pytest.raises(AuthError, match="unexpected location"):
+        client.login()
+
+
+@pytest.mark.parametrize("status", [200, 400])
+def test_login_auth0_bad_credentials_detected(status):
+    """Auth0 re-renders /u/login (HTTP 400) on a wrong email or password: that
+    must read as a credentials problem, not a generic "Login rejected"."""
+    client = _login_client()
+    with pytest.raises(AuthError, match="check email and password"):
+        client._finish_login(_FakeResp(AUTH0_LOGIN_URL, status_code=status,  # pylint: disable=protected-access
+                                       text=AUTH0_SIGNIN_HTML))
+
+
+@pytest.mark.parametrize("status", [404, 503])
+def test_login_auth0_outage_is_not_a_credentials_failure(status):
+    client = _login_client()
+    with pytest.raises(AuthError, match="identity service unavailable") as excinfo:
+        client._finish_login(_FakeResp(AUTH0_LOGIN_URL, status_code=status))  # pylint: disable=protected-access
+    assert "check email and password" not in str(excinfo.value)
+
+
+def test_login_unknown_sign_in_form_still_reported():
+    """A form that is neither the old VW identity form nor Auth0's keeps the
+    "could not parse" message, listing the field names it found."""
+    client = _login_client({IDENTITY + "/oidc/v1/authorize": _FakeResp(
+        AUTH0_LOGIN_URL, text='<form><input name="state" value="s1"><input name="otp"></form>')})
+    client._session.post = lambda *a, **k: pytest.fail("POST on an unknown sign-in form")
+    with pytest.raises(AuthError, match=r"parse the sign-in form \(fields found: \['otp', 'state'\]\)"):
+        client.login()
 
 
 def test_user_agent_is_rfc9110_product_token():

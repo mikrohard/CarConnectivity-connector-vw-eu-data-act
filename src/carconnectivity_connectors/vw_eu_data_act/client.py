@@ -48,6 +48,8 @@ CALLBACK_LOGIN_PATH = "/services/callbacklogin"
 MARKETING_CALLBACK_PATHS = ("/oidc/v1/oauth/client/callback", "/oidc/v1/oauth/client/callback/success")
 LOGIN_REDIRECT_STATUSES = frozenset({301, 302, 303})
 MAX_LOGIN_REDIRECTS = 10
+# Sign-in pages (identifier, password, ...) a login may go through.
+MAX_LOGIN_FORMS = 3
 
 OIDC_AUTHORIZE_URL = IDENTITY_BASE + "/oidc/v1/authorize"
 OIDC_CLIENT_ID = "9b58543e-1c15-4193-91d5-8a14145bebb0@apps_vw-dilab_com"
@@ -244,17 +246,85 @@ def _login_fields(html: str) -> Tuple[Dict[str, str], Optional[str]]:
     return fields, form.action
 
 
-def _is_auth0_login_form(fields: Dict[str, str]) -> bool:
-    """True for VW's new Auth0 Universal Login page (Oct 2026 migration).
+class _LoginForm:  # pylint: disable=too-few-public-methods
+    """A sign-in form found on an identity page, ready to be filled and POSTed."""
 
-    That page has only ``state``/``username``/``password`` inputs and none of
-    the old hmac/_csrf templateModel fields; it's a single POST back to the
-    same URL instead of the old two-step identifier/password flow.
+    def __init__(self, kind: str, fields: Dict[str, str], post_url: str,
+                 identifier_fields: Tuple[str, ...], asks_password: bool) -> None:
+        self.kind = kind
+        self.fields = fields
+        self.post_url = post_url
+        self.identifier_fields = identifier_fields
+        self.asks_password = asks_password
+
+    @property
+    def step(self) -> str:
+        """Name of the login step for messages and logs."""
+        return "password step" if self.asks_password else "identifier step"
+
+    def filled(self, email: str, password: str) -> Dict[str, str]:
+        """The form fields with the credentials it asks for."""
+        data = dict(self.fields)
+        for name in self.identifier_fields:
+            data[name] = email
+        if self.asks_password:
+            data["password"] = password
+        return data
+
+
+def _detect_login_form(url: str, html: str) -> Optional[_LoginForm]:
+    """Recognise the sign-in form on an identity page from its content alone.
+
+    Nothing depends on the brand: each brand is moved from one flow to the
+    other by VW on its own schedule (on 2026-11-01 SEAT and CUPRA were on
+    Auth0, the other brands still on signin-service), so the page decides.
+
+    - VW signin-service (``hmac`` and ``_csrf`` from HTML inputs and/or the JS
+      templateModel): the identifier page asks for ``email``, the authenticate
+      page (``/authenticate`` in its action, URL or templateModel postAction)
+      for ``email`` + ``password``. The authenticate POST goes to the clean
+      URL: its ``?relayState=`` duplicates the body field (HTTP 400).
+    - Any other HTML form with an identifier (``username``/``email``) and/or
+      a ``password`` input, e.g. Auth0 Universal Login (``/u/login``, issue
+      #60), either combined or split into ``/u/login/identifier`` and
+      ``/u/login/password``. It is POSTed back to its action, or to the page
+      URL itself (``?state=`` included, as Auth0 and evcc do).
+
+    Account creation pages are never sign-in forms, although they ask for an
+    email and a password too: signin-service sends an unknown email to
+    ``.../register`` (template ``registerCredentials``), Auth0 has
+    ``/u/signup``. Credentials must never be POSTed there.
+
+    Returns None when the page holds no sign-in form.
     """
-    return (
-        "username" in fields and "password" in fields and "state" in fields
-        and "hmac" not in fields and "_csrf" not in fields
-    )
+    fields, action = _login_fields(html)
+    model = _extract_template_model(html)
+    hints = tuple(hint.lower() for hint in (action or "", urlparse(url).path, str(model.get("postAction") or ""),
+                                            str(model.get("template") or "")))
+    if any(word in hint for hint in hints for word in ("register", "signup")):
+        return None
+    if "hmac" in fields and "_csrf" in fields:
+        asks_password = any("authenticate" in hint for hint in hints)
+        if action:
+            post_url = urljoin(url, action)
+        else:
+            post_url = url.split("?", 1)[0] if asks_password else url
+        return _LoginForm("signin-service", fields, post_url, ("email",), asks_password)
+    identifier_fields = tuple(name for name in ("username", "email") if name in fields)
+    asks_password = "password" in fields
+    if not identifier_fields and not asks_password:
+        return None
+    return _LoginForm("form", fields, urljoin(url, action) if action else url, identifier_fields, asks_password)
+
+
+def _is_sign_in_page_again(url: str, html: str) -> bool:
+    """True if a page reached after the password POST holds a sign-in form.
+
+    Bad credentials re-render the sign-in form: signin-service with HTTP 200,
+    Auth0 (``/u/login``) with HTTP 400. Judged from the content, so it holds
+    for either flow and any brand.
+    """
+    return urlparse(url).netloc.lower() == IDENTITY_HOST and _detect_login_form(url, html) is not None
 
 
 def _login_error(html: str) -> Optional[str]:
@@ -392,77 +462,49 @@ class EudaApiClient:
         signin_html = resp.text
         LOG.debug("login step2: signin page = %s (%d bytes)", signin_url, len(signin_html))
 
-        # 2. POST the email (identifier step). Fields come from HTML inputs
-        #    and/or the JS templateModel (hmac, _csrf, relayState).
-        fields, action = _login_fields(signin_html)
-        LOG.debug("login step2: action=%s fields=%s", action, sorted(fields))
-
-        if _is_auth0_login_form(fields):
-            # Auth0 Universal Login (Oct 2026 migration, issue #60): one POST
-            # of state+username+password back to the signin URL, no separate
-            # identifier/password steps.
-            fields["username"] = self._email
-            fields["password"] = self._password
-            post_url = urljoin(signin_url, action) if action else signin_url
-            LOG.debug("login step2 (auth0): POST credentials to %s", post_url)
+        # 2. Fill in and POST the sign-in forms the identity provider serves,
+        #    recognised from each page's content (_detect_login_form), never
+        #    from the brand: signin-service asks for the email, then the
+        #    password; Auth0 Universal Login (issue #60) for both at once, or
+        #    split over two pages. Redirects are followed by hand on the
+        #    identity/portal hosts only, and the password is sent once at most:
+        #    a re-rendered form afterwards means bad credentials, never a retry.
+        url, html = signin_url, signin_html
+        email_sent = False
+        for _ in range(MAX_LOGIN_FORMS):
+            form = _detect_login_form(url, html)
+            if form is None or (email_sent and not form.asks_password):
+                # The email was not taken: no form, or the identifier form again.
+                if not email_sent:
+                    fields, _action = _login_fields(html)
+                    raise AuthError(f"Could not parse the sign-in form (fields found: {sorted(fields)})")
+                err = _login_error(html)
+                raise AuthError(err or "Identity portal did not return the password form - check the "
+                                "email address (or the login flow changed)")
+            target = urlparse(form.post_url)
+            if target.scheme != "https" or target.netloc.lower() != IDENTITY_HOST:
+                raise AuthError(f"Sign-in form posts to an unexpected location ({target.scheme}://{target.netloc})")
+            LOG.debug("login: %s form, %s, POST to %s fields=%s", form.kind, form.step,
+                      target.path, sorted(form.fields))
             resp = self._session.post(
-                post_url,
-                data=fields,
-                headers={"Referer": signin_url},
+                form.post_url,
+                data=form.filled(self._email, self._password),
+                headers={"Referer": url},
                 allow_redirects=False,
                 timeout=self._timeout,
             )
-            _raise_for_unavailable_login(resp, "auth0 sign-in step")
-            self._finish_login(self._follow_login_redirects(resp))
-            return
-
-        if "hmac" not in fields or "_csrf" not in fields:
-            raise AuthError(f"Could not parse the sign-in form (fields found: {sorted(fields)})")
-        fields["email"] = self._email
-        identifier_action = urljoin(signin_url, action or "")
-        resp = self._session.post(
-            identifier_action,
-            data=fields,
-            headers={"Referer": signin_url},
-            timeout=self._timeout,
-        )
-        _raise_for_unavailable_login(resp, "identifier step")
-        authenticate_url = resp.url
-        authenticate_html = resp.text
-        LOG.debug("login step3: after identifier POST status=%s url=%s", resp.status_code, authenticate_url)
-
-        # 3. The identifier step lands on the password (authenticate) page,
-        #    whose hidden fields live in the JS templateModel, not HTML inputs.
-        fields2, action2 = _login_fields(authenticate_html)
-        LOG.debug("login step3: action=%s fields=%s", action2, sorted(fields2))
-        if "hmac" not in fields2 or "_csrf" not in fields2:
-            err = _login_error(authenticate_html)
-            raise AuthError(
-                err
-                or "Identity portal did not return the password form - check the "
-                "email address (or the login flow changed)"
-            )
-        fields2["email"] = self._email
-        fields2["password"] = self._password
-        # The browser posts to the clean /login/authenticate URL with relayState
-        # in the body; posting to authenticate_url (which carries ?relayState=)
-        # duplicates it and is rejected with HTTP 400. Strip the query.
-        if action2:
-            authenticate_action = urljoin(authenticate_url, action2)
-        else:
-            authenticate_action = authenticate_url.split("?", 1)[0]
-        LOG.debug("login step4: POST credentials to %s", authenticate_action)
-
-        # 4. POST credentials; follow the redirect chain back to the portal,
-        #    which sets the session cookie via /services/callbacklogin.
-        resp = self._session.post(
-            authenticate_action,
-            data=fields2,
-            headers={"Referer": authenticate_url},
-            allow_redirects=False,
-            timeout=self._timeout,
-        )
-        self._finish_login(self._follow_login_redirects(resp))
+            _raise_for_unavailable_login(resp, form.step)
+            resp = self._follow_login_redirects(resp)
+            if form.asks_password or _is_portal_callback(resp.url):
+                # The redirect chain ends on the portal callback, which sets
+                # the session cookie via /services/callbacklogin.
+                self._finish_login(resp)
+                return
+            _raise_for_unavailable_login(resp, form.step)
+            email_sent = True
+            url, html = resp.url, resp.text
+            LOG.debug("login: after %s status=%s url=%s", form.step, resp.status_code, urlparse(url).path)
+        raise AuthError(f"Login did not reach the password form within {MAX_LOGIN_FORMS} sign-in pages")
 
     def _follow_login_redirects(self, resp: requests.Response) -> requests.Response:
         """Follow the post-credentials redirects up to the portal callback.
@@ -513,6 +555,10 @@ class EudaApiClient:
 
         landing_html = resp.text
         if resp.status_code >= 400:
+            if _is_sign_in_page_again(landing, landing_html):
+                # Auth0 Universal Login (issue #60) re-renders its form with
+                # HTTP 400 when the email or password is wrong.
+                raise AuthError("Login failed - check email and password")
             LOG.debug("login step4: HTTP %s body[:500]=%s", resp.status_code, landing_html[:500])
             err = _login_error(landing_html)
             raise AuthError(err or f"Login rejected (HTTP {resp.status_code})")
@@ -556,9 +602,10 @@ class EudaApiClient:
             )
 
         # The chain stopped before the portal callback. Bad credentials
-        # re-render the identity sign-in page (URL still on
-        # identity.vwgroup.io/signin-service).
-        if "signin-service" in landing or "/error" in landing:
+        # re-render a sign-in form (whatever the flow), or leave the URL on
+        # identity.vwgroup.io/signin-service.
+        if (_is_sign_in_page_again(landing, landing_html)
+                or "signin-service" in landing or "/error" in landing):
             raise AuthError("Login failed - check email and password")
         ended = urlparse(landing)
         raise AuthError(f"Login did not complete (ended at {ended.scheme}://{ended.netloc}{ended.path})")
