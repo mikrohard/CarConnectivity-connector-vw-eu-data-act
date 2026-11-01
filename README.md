@@ -155,6 +155,7 @@ delivery's `createdOn` is used as the measurement time rather than leaving it to
 |---|---|---|
 | `mileage.value` / `mileage` | `vehicle.odometer` | unit from `mileage.unit` |
 | `outside_temperature` | `vehicle.outside_temperature` | deci-Kelvin → °C |
+| `boardnetBatteryVoltageIndication` | `vehicle.battery_12v_voltage` | 12 V battery voltage in volts (no unit attached: the core has none for voltage); connector attribute (tag `connector_custom`), not in the core model |
 | `locked` / `lock_state` | `vehicle.doors.lock_state` | |
 | `open_state_*` (per door) | `vehicle.doors[*].open_state` | front/rear L/R, bonnet, tailgate |
 | `locked_state_*` (per door) | `vehicle.doors[*].lock_state` | |
@@ -172,6 +173,7 @@ delivery's `createdOn` is used as the measurement time rather than leaving it to
 | `maintenance_interval__time_until_oil_change` | `maintenance.oil_service_due_at` | |
 | `maintenance_interval_distance_until_*` | `maintenance.*_due_after` (km) | |
 | `remaining_climatisation_time` | `climatization.estimated_date_reached` | minutes (flat). The dotted `remaining_climate_time` is left unmapped: the data dictionary defines it as how long the AC runs once started, not a countdown |
+| `climatisation_state` | `climatization.state` | flat; `off`, `heating` (also `heatingAuxiliary`), `cooling`, `ventilation`, `invalid`; any other value reads as unknown |
 
 ### Electric drive (`secondary` on PHEV, `primary` on EV)
 

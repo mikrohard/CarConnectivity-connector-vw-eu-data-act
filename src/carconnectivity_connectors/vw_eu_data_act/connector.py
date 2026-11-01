@@ -24,7 +24,9 @@ from enum import Enum
 from carconnectivity.errors import AuthenticationError, RetrievalError, TooManyRequestsError
 from carconnectivity.util import config_remove_credentials
 from carconnectivity.units import Energy, EnergyConsumption, FuelConsumption, Length, Power, Speed, Temperature
-from carconnectivity.attributes import BooleanAttribute, DateAttribute, DurationAttribute, EnergyAttribute, EnumAttribute
+from carconnectivity.attributes import (BooleanAttribute, DateAttribute, DurationAttribute, EnergyAttribute, EnumAttribute,
+                                         FloatAttribute)
+from carconnectivity.climatization import Climatization
 from carconnectivity.vehicle import GenericVehicle, ElectricVehicle, CombustionVehicle
 from carconnectivity.drive import CombustionDrive, DieselDrive, ElectricDrive, GenericDrive
 from carconnectivity.battery import Battery
@@ -271,6 +273,9 @@ KNOWN_MAPPED_FIELDS: set[str] = {
     # (see the climatisation block of _map_dataset).
     'remaining_climate_time',
     'remaining_climatisation_time',
+    # Flat climatisation state and 12 V battery voltage (issue #59).
+    'climatisation_state',
+    'boardnetBatteryVoltageIndication',
     # Flat-format charging + consumption (mapped in _map_electric).
     'charging_state',
     'charging_mode',
@@ -494,6 +499,19 @@ def _auto_unlock(raw) -> Optional[bool]:
 _BATTERY_CARE_MODE = {
     'BCAM_ACTIVATION_ACTIVATED': True,
     'BCAM_ACTIVATION_DEACTIVATED': False,
+}
+
+# Flat climatisation_state (issue #59). The data dictionary does not list the
+# field; "off" is the value seen on a SEAT Leon e-Hybrid, and the others are
+# the climatisation states of VW's own vehicle API, which the core enum
+# mirrors. Matched case-insensitively.
+_CLIMATIZATION_STATE = {
+    'off': Climatization.ClimatizationState.OFF,
+    'heating': Climatization.ClimatizationState.HEATING,
+    'heatingauxiliary': Climatization.ClimatizationState.HEATING,
+    'cooling': Climatization.ClimatizationState.COOLING,
+    'ventilation': Climatization.ClimatizationState.VENTILATION,
+    'invalid': Climatization.ClimatizationState.INVALID,
 }
 
 
@@ -1158,6 +1176,24 @@ class Connector(BaseConnector):
         if clim_minutes is not None:
             _stamp(vehicle.climatization.estimated_date_reached,
                 value=date_anchor + timedelta(minutes=clim_minutes), measured=captured_at)
+
+        # Flat climatisation_state -> climatization.state (issue #59). A value
+        # outside the table reads as "unknown" and is logged so it can be added.
+        clim_state = dataset.value_of('climatisation_state')
+        if clim_state is not None:
+            state = _CLIMATIZATION_STATE.get(str(clim_state).strip().lower())
+            if state is None:
+                LOG.debug("%s: unknown climatisation_state %r", vin, clim_state)
+                state = Climatization.ClimatizationState.UNKNOWN
+            _stamp(vehicle.climatization.state, value=state, measured=captured_at)
+
+        # 12 V (boardnet) battery voltage in volts, "current boardnet battery
+        # voltage (V)" in the data dictionary (issue #59). No core model and no
+        # voltage unit in the core, so a unitless connector attribute.
+        boardnet_voltage = dataset.value_of('boardnetBatteryVoltageIndication')
+        if isinstance(boardnet_voltage, (int, float)) and boardnet_voltage > 0:
+            _stamp(_custom_attribute(vehicle, 'battery_12v_voltage', FloatAttribute, precision=0.01),
+                   float(boardnet_voltage), measured=captured_at)
 
         # Doors, windows and lights status (applies to all vehicles).
         self._map_status(vehicle, dataset, captured_at)

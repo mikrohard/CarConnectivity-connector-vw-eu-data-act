@@ -16,6 +16,7 @@ import pytest
 from carconnectivity.carconnectivity import CarConnectivity
 from carconnectivity.charging import Charging
 from carconnectivity.charging_connector import ChargingConnector
+from carconnectivity.climatization import Climatization
 from carconnectivity.doors import Doors
 from carconnectivity.errors import TooManyRequestsError
 from carconnectivity.observable import Observable
@@ -2671,3 +2672,57 @@ def test_leon_ehybrid_plug_fields_not_flagged_unmapped(caplog):
         Connector._detect_unmapped_fields(VIN, ds)  # pylint: disable=protected-access
     assert "charging_plug1_connectionstate" not in caplog.text
     assert "charging_plug1_lock_state" not in caplog.text
+    assert "field=climatisation_state " not in caplog.text
+    assert "field=boardnetBatteryVoltageIndication " not in caplog.text
+
+
+# --- climatisation state and 12 V battery voltage (issue #59) ----------------
+
+def test_leon_ehybrid_climatisation_state_and_12v_voltage(connector):
+    """The Leon e-Hybrid export carries climatisation_state "off" and the 12 V
+    boardnet voltage (13.65 V, in volts as the dictionary says)."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    with open(LEON_EHYBRID_SAMPLE, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+    payload["vin"] = VIN
+    connector._map_dataset(VIN, Dataset.from_json(payload))  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert v.climatization.state.value == Climatization.ClimatizationState.OFF
+    assert v.battery_12v_voltage.value == 13.65
+    assert v.battery_12v_voltage.unit is None
+    assert v.battery_12v_voltage.tags == {'connector_custom'}
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ("off", Climatization.ClimatizationState.OFF),
+    ("heating", Climatization.ClimatizationState.HEATING),
+    ("heatingAuxiliary", Climatization.ClimatizationState.HEATING),
+    ("cooling", Climatization.ClimatizationState.COOLING),
+    ("ventilation", Climatization.ClimatizationState.VENTILATION),
+    ("invalid", Climatization.ClimatizationState.INVALID),
+    ("somethingNew", Climatization.ClimatizationState.UNKNOWN),
+])
+def test_flat_climatisation_state_values(connector, raw, expected):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, _flat_ev_dataset(("climatisation_state", raw)))  # pylint: disable=protected-access
+    assert garage.get_vehicle(VIN).climatization.state.value == expected
+
+
+@pytest.mark.parametrize("raw", ["0", "-1", "abc"])
+def test_12v_voltage_ignores_missing_or_bogus_values(connector, raw):
+    """No attribute is created for a vehicle that never reports a usable
+    12 V voltage."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, _flat_ev_dataset(("boardnetBatteryVoltageIndication", raw)))  # pylint: disable=protected-access
+    assert not hasattr(garage.get_vehicle(VIN), 'battery_12v_voltage')
+
+
+def test_12v_voltage_absent_creates_no_attribute(connector):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaElectricVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, _flat_ev_dataset())  # pylint: disable=protected-access
+    assert not hasattr(garage.get_vehicle(VIN), 'battery_12v_voltage')
