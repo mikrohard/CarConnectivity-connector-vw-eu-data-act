@@ -244,6 +244,19 @@ def _login_fields(html: str) -> Tuple[Dict[str, str], Optional[str]]:
     return fields, form.action
 
 
+def _is_auth0_login_form(fields: Dict[str, str]) -> bool:
+    """True for VW's new Auth0 Universal Login page (Oct 2026 migration).
+
+    That page has only ``state``/``username``/``password`` inputs and none of
+    the old hmac/_csrf templateModel fields; it's a single POST back to the
+    same URL instead of the old two-step identifier/password flow.
+    """
+    return (
+        "username" in fields and "password" in fields and "state" in fields
+        and "hmac" not in fields and "_csrf" not in fields
+    )
+
+
 def _login_error(html: str) -> Optional[str]:
     """Return a human-readable login error from the page, if present."""
     model = _extract_template_model(html)
@@ -383,6 +396,26 @@ class EudaApiClient:
         #    and/or the JS templateModel (hmac, _csrf, relayState).
         fields, action = _login_fields(signin_html)
         LOG.debug("login step2: action=%s fields=%s", action, sorted(fields))
+
+        if _is_auth0_login_form(fields):
+            # Auth0 Universal Login (Oct 2026 migration, issue #60): one POST
+            # of state+username+password back to the signin URL, no separate
+            # identifier/password steps.
+            fields["username"] = self._email
+            fields["password"] = self._password
+            post_url = urljoin(signin_url, action) if action else signin_url
+            LOG.debug("login step2 (auth0): POST credentials to %s", post_url)
+            resp = self._session.post(
+                post_url,
+                data=fields,
+                headers={"Referer": signin_url},
+                allow_redirects=False,
+                timeout=self._timeout,
+            )
+            _raise_for_unavailable_login(resp, "auth0 sign-in step")
+            self._finish_login(self._follow_login_redirects(resp))
+            return
+
         if "hmac" not in fields or "_csrf" not in fields:
             raise AuthError(f"Could not parse the sign-in form (fields found: {sorted(fields)})")
         fields["email"] = self._email
