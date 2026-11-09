@@ -398,6 +398,15 @@ def _window_open_code(position, state) -> "Optional[str]":
     return _open_code(state)
 
 
+def _is_diesel(dataset) -> bool:
+    """Infer a diesel from a *numeric* SCR (AdBlue) range.
+
+    The portal has no fuel-type field. Petrol/PHEV cars also carry the scr_range
+    field but report it as an empty string.
+    """
+    return isinstance(dataset.value_of('scr_range'), (int, float))
+
+
 def _lock_code(value) -> "Optional[str]":
     """Decode the portal 'open' encoding for locks: 2 = locked, 3 = unlocked."""
     if value == 2:
@@ -1056,12 +1065,14 @@ class Connector(BaseConnector):
         #   - fuel:     fuel level / petrol consumption
         # A car reporting both is a plug-in hybrid (PHEV). Promotion only ever moves
         # "up" (Hybrid is a subclass of both Electric and Combustion), so a partial
-        # dataset never demotes an already-richer vehicle.
-        has_electric = any(dataset.by_field(f) is not None for f in (
+        # dataset never demotes an already-richer vehicle. Only fields carrying a
+        # value count: a single-engine diesel reports cruising_range_secondary_engine
+        # as an entry without any value, which is not electric data.
+        has_electric = any(dataset.value_of(f) is not None for f in (
             'battery_state_report.soc', 'battery_state_report.charge_power',
             'charging_state_report.current_charge_state', 'state_of_charge',
             'cruising_range_secondary_engine', 'battery_level_HV.value'))
-        has_fuel = any(dataset.by_field(f) is not None for f in (
+        has_fuel = any(dataset.value_of(f) is not None for f in (
             'fuel_level_current_level', 'tank_current_level',
             'long_term_data_average_fuel_consumption', 'short_term_data_average_fuel_consumption'))
         # A pure EV in flat format reports only cruising_range_primary_engine (its
@@ -1081,6 +1092,8 @@ class Connector(BaseConnector):
             already = isinstance(vehicle, ElectricVehicle)
         elif has_fuel:
             desired, desired_type = VWEudaCombustionVehicle, GenericVehicle.Type.GASOLINE
+            if _is_diesel(dataset):
+                desired_type = GenericVehicle.Type.DIESEL
             already = isinstance(vehicle, CombustionVehicle)
         else:
             desired, desired_type, already = None, None, True
@@ -1564,12 +1577,10 @@ class Connector(BaseConnector):
     def _map_combustion(self, vehicle: "VWEudaVehicle", dataset: Dataset,
                         captured_at: "Optional[datetime]") -> None:
         """Map combustion-engine fields (fuel level, petrol range and consumption)."""
-        # The portal has no fuel-type field, so infer a diesel from a *numeric* SCR
-        # (AdBlue) range: petrol/PHEV cars also carry the scr_range field but report
-        # it as an empty string. A diesel needs a DieselDrive because adblue_range
-        # only exists there (a plain CombustionDrive would raise AttributeError).
+        # A diesel needs a DieselDrive because adblue_range only exists there (a
+        # plain CombustionDrive would raise AttributeError).
         adblue_range = dataset.value_of('scr_range')
-        is_diesel = isinstance(adblue_range, (int, float))
+        is_diesel = _is_diesel(dataset)
 
         # The combustion engine is the portal's primary engine (matching the
         # seatcupra convention where the primary slot is the fuel engine on a PHEV).

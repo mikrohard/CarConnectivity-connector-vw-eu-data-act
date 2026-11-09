@@ -1056,6 +1056,54 @@ def test_diesel_creates_dieseldrive_and_maps_adblue(connector):
     assert drive.adblue_range.unit == Length.KM
 
 
+def test_valueless_secondary_range_does_not_make_a_diesel_a_hybrid(connector):
+    """A single-engine diesel (VW Caddy, flat format) carries
+    cruising_range_secondary_engine as an entry with no value at all. Only a
+    field that holds a value may count as electric data, otherwise the car is
+    promoted to a PHEV with a phantom electric drive."""
+    from carconnectivity.vehicle import ElectricVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+        {"key": "b", "dataFieldName": "cruising_range_primary_engine", "value": "350"},
+        {"key": "c", "dataFieldName": "cruising_range_secondary_engine",
+         "timestampUtc": "2026-11-07T15:34:46.000Z"},
+        {"key": "d", "dataFieldName": "scr_range", "value": "10000"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert not isinstance(v, ElectricVehicle)
+    assert list(v.drives.drives) == ["primary"]
+
+
+def test_diesel_vehicle_type_is_diesel(connector):
+    """A numeric scr_range already makes the drive a DieselDrive; the vehicle
+    type must say diesel too rather than the gasoline default."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+        {"key": "b", "dataFieldName": "scr_range", "value": "10000"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.DIESEL"
+
+
+def test_petrol_vehicle_type_stays_gasoline_with_empty_scr_range(connector):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "b", "dataFieldName": "scr_range", "value": ""},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.GASOLINE"
+
+
 def test_petrol_empty_scr_range_stays_combustion_no_crash(connector):
     """Petrol/PHEV cars also carry the scr_range field but report it as an empty
     string. That must NOT be read as diesel (no DieselDrive) and must not raise."""
