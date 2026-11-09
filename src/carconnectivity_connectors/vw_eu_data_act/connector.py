@@ -1138,6 +1138,13 @@ class Connector(BaseConnector):
             mileage_unit = Length.MI if resolve_distance_unit(dataset.value_of('mileage.unit')) == 'mi' else Length.KM
             _stamp(vehicle.odometer, value=mileage, measured=captured_at, unit=mileage_unit)
             vehicle.odometer.precision = 1
+        else:
+            # Some flat-format datasets only provide a bare 'mileage' field, on
+            # any drivetrain.
+            flat_mileage = dataset.freshest_max_value_of('mileage')
+            if flat_mileage is not None:
+                _stamp(vehicle.odometer, value=flat_mileage, measured=captured_at, unit=Length.KM)
+                vehicle.odometer.precision = 1
 
         # Doors lock state
         locked = dataset.value_of('locked')
@@ -1268,12 +1275,6 @@ class Connector(BaseConnector):
             if e_range is not None:
                 _stamp(drive.range, value=e_range, measured=captured_at, unit=e_range_unit)
                 drive.range.precision = 1
-
-            # Some flat-format datasets only provide a bare 'mileage' field.
-            flat_mileage = dataset.freshest_max_value_of('mileage')
-            if flat_mileage is not None and mileage is None:
-                _stamp(vehicle.odometer, value=flat_mileage, measured=captured_at, unit=Length.KM)
-                vehicle.odometer.precision = 1
 
         if isinstance(vehicle, CombustionVehicle):
             self._map_combustion(vehicle, dataset, captured_at)
