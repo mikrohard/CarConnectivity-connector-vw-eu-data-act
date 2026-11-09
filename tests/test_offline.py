@@ -1166,6 +1166,30 @@ def test_valueless_primary_range_alone_is_not_an_ev(connector):
     assert not isinstance(garage.get_vehicle(VIN), ElectricVehicle)
 
 
+CADDY_DIESEL_SAMPLE = os.path.join(os.path.dirname(__file__), "caddy_diesel_sample_dataset.json")
+
+
+def test_caddy_diesel_real_world_sample(connector):
+    """Full mapping against an anonymised real flat VW Caddy 2.0 TDI dataset,
+    the first combustion-only export: cruising_range_secondary_engine arrives
+    without a value and must not make it a hybrid."""
+    from carconnectivity.drive import DieselDrive
+    from carconnectivity.vehicle import CombustionVehicle, ElectricVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    payload = json.load(open(CADDY_DIESEL_SAMPLE, "r", encoding="utf-8"))
+    payload["vin"] = VIN
+    connector._map_dataset(VIN, Dataset.from_json(payload))  # pylint: disable=protected-access
+    v = garage.get_vehicle(VIN)
+
+    assert isinstance(v, CombustionVehicle) and not isinstance(v, ElectricVehicle)
+    assert str(v.type.value) == "Type.DIESEL"
+    assert list(v.drives.drives) == ["primary"]
+    primary = v.drives.drives["primary"]
+    assert isinstance(primary, DieselDrive)
+    assert primary.range.value == 130 and primary.level.value == 22
+
+
 def test_petrol_vehicle_type_stays_gasoline_with_empty_scr_range(connector):
     garage = connector.car_connectivity.garage
     garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
