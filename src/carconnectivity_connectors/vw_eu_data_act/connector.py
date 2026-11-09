@@ -401,8 +401,9 @@ def _window_open_code(position, state) -> "Optional[str]":
 def _is_diesel(dataset) -> bool:
     """Infer a diesel from a *numeric* SCR (AdBlue) range.
 
-    The portal has no fuel-type field. Petrol/PHEV cars also carry the scr_range
-    field but report it as an empty string.
+    The data dictionary defines an engine_type enum, but no delivery we hold
+    carries it. Petrol/PHEV cars also carry the scr_range field but report it as
+    an empty string.
     """
     return isinstance(dataset.value_of('scr_range'), (int, float))
 
@@ -1106,7 +1107,10 @@ class Connector(BaseConnector):
         if _is_diesel(dataset) and isinstance(vehicle, CombustionVehicle) \
                 and not isinstance(vehicle, ElectricVehicle):
             vehicle.type._set_value(GenericVehicle.Type.DIESEL)  # pylint: disable=protected-access
-        is_phev = has_electric and has_fuel
+        # From the promoted class, not this dataset: a hybrid delivery can arrive
+        # with empty electric fields, and the electric drive must not then take
+        # the primary (fuel) range.
+        is_phev = isinstance(vehicle, ElectricVehicle) and isinstance(vehicle, CombustionVehicle)
 
         # Dataset freshness, exposed PER VEHICLE: one connector serves several VINs,
         # each with its own capture time, so this cannot live on the connector. It is

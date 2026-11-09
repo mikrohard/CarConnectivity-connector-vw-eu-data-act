@@ -1123,6 +1123,36 @@ def test_diesel_evidence_does_not_retype_a_hybrid(connector):
     assert str(garage.get_vehicle(VIN).type.value) == "Type.HYBRID"
 
 
+def test_hybrid_delivery_without_electric_values_keeps_the_electric_range(connector):
+    """A hybrid's combustion and battery values do not always arrive together.
+    A later delivery with empty electric fields must not hand the primary (fuel)
+    range to the electric drive."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "state_of_charge", "value": "25",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+        {"key": "b", "dataFieldName": "fuel_level_current_level", "value": "37",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+        {"key": "c", "dataFieldName": "cruising_range_primary_engine", "value": "480",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+        {"key": "d", "dataFieldName": "cruising_range_secondary_engine", "value": "4",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+    ]}))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "b", "dataFieldName": "fuel_level_current_level", "value": "37",
+         "timestampUtc": "2026-11-07T11:00:00.000Z"},
+        {"key": "c", "dataFieldName": "cruising_range_primary_engine", "value": "480",
+         "timestampUtc": "2026-11-07T11:00:00.000Z"},
+        {"key": "d", "dataFieldName": "cruising_range_secondary_engine",
+         "timestampUtc": "2026-11-07T11:00:00.000Z"},
+    ]}))
+
+    drive = garage.get_vehicle(VIN).get_electric_drive()
+    assert drive.id == "secondary"
+    assert drive.range.value == 4
+
+
 def test_valueless_primary_range_alone_is_not_an_ev(connector):
     """The flat-format EV fallback must ignore a cruising_range_primary_engine
     entry that carries no value."""
