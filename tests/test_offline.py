@@ -1188,6 +1188,7 @@ def test_caddy_diesel_real_world_sample(connector):
     primary = v.drives.drives["primary"]
     assert isinstance(primary, DieselDrive)
     assert primary.range.value == 130 and primary.level.value == 22
+    assert v.odometer.value == 63359
 
 
 def test_petrol_vehicle_type_stays_gasoline_with_empty_scr_range(connector):
