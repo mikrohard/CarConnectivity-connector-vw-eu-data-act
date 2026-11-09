@@ -1056,6 +1056,152 @@ def test_diesel_creates_dieseldrive_and_maps_adblue(connector):
     assert drive.adblue_range.unit == Length.KM
 
 
+def test_valueless_secondary_range_does_not_make_a_diesel_a_hybrid(connector):
+    """A single-engine diesel (VW Caddy, flat format) carries
+    cruising_range_secondary_engine as an entry with no value at all. Only a
+    field that holds a value may count as electric data, otherwise the car is
+    promoted to a PHEV with a phantom electric drive."""
+    from carconnectivity.vehicle import ElectricVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+        {"key": "b", "dataFieldName": "cruising_range_primary_engine", "value": "350"},
+        {"key": "c", "dataFieldName": "cruising_range_secondary_engine",
+         "timestampUtc": "2026-11-07T15:34:46.000Z"},
+        {"key": "d", "dataFieldName": "scr_range", "value": "10000"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    v = garage.get_vehicle(VIN)
+    assert not isinstance(v, ElectricVehicle)
+    assert list(v.drives.drives) == ["primary"]
+
+
+def test_diesel_vehicle_type_is_diesel(connector):
+    """A numeric scr_range already makes the drive a DieselDrive; the vehicle
+    type must say diesel too rather than the gasoline default."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+        {"key": "b", "dataFieldName": "scr_range", "value": "10000"},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.DIESEL"
+
+
+def test_diesel_evidence_in_a_later_dataset_updates_vehicle_type(connector):
+    """A combustion vehicle typed gasoline by an earlier dataset without
+    scr_range is no longer promoted, so a later numeric scr_range must still
+    turn its type into diesel."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+    ]}))
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.GASOLINE"
+
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+        {"key": "b", "dataFieldName": "scr_range", "value": "10000"},
+    ]}))
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.DIESEL"
+
+
+def test_diesel_evidence_does_not_retype_a_hybrid(connector):
+    """A PHEV keeps its hybrid type even when a dataset carries a numeric
+    scr_range."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "state_of_charge", "value": "25"},
+        {"key": "b", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "c", "dataFieldName": "scr_range", "value": "10000"},
+    ]}))
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.HYBRID"
+
+
+def test_hybrid_delivery_without_electric_values_keeps_the_electric_range(connector):
+    """A hybrid's combustion and battery values do not always arrive together.
+    A later delivery with empty electric fields must not hand the primary (fuel)
+    range to the electric drive."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "state_of_charge", "value": "25",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+        {"key": "b", "dataFieldName": "fuel_level_current_level", "value": "37",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+        {"key": "c", "dataFieldName": "cruising_range_primary_engine", "value": "480",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+        {"key": "d", "dataFieldName": "cruising_range_secondary_engine", "value": "4",
+         "timestampUtc": "2026-11-07T10:00:00.000Z"},
+    ]}))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "b", "dataFieldName": "fuel_level_current_level", "value": "37",
+         "timestampUtc": "2026-11-07T11:00:00.000Z"},
+        {"key": "c", "dataFieldName": "cruising_range_primary_engine", "value": "480",
+         "timestampUtc": "2026-11-07T11:00:00.000Z"},
+        {"key": "d", "dataFieldName": "cruising_range_secondary_engine",
+         "timestampUtc": "2026-11-07T11:00:00.000Z"},
+    ]}))
+
+    drive = garage.get_vehicle(VIN).get_electric_drive()
+    assert drive.id == "secondary"
+    assert drive.range.value == 4
+
+
+def test_valueless_primary_range_alone_is_not_an_ev(connector):
+    """The flat-format EV fallback must ignore a cruising_range_primary_engine
+    entry that carries no value."""
+    from carconnectivity.vehicle import ElectricVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "cruising_range_primary_engine",
+         "timestampUtc": "2026-11-07T15:34:46.000Z"},
+    ]}))
+    assert not isinstance(garage.get_vehicle(VIN), ElectricVehicle)
+
+
+CADDY_DIESEL_SAMPLE = os.path.join(os.path.dirname(__file__), "caddy_diesel_sample_dataset.json")
+
+
+def test_caddy_diesel_real_world_sample(connector):
+    """Full mapping against an anonymised real flat VW Caddy 2.0 TDI dataset,
+    the first combustion-only export: cruising_range_secondary_engine arrives
+    without a value and must not make it a hybrid."""
+    from carconnectivity.drive import DieselDrive
+    from carconnectivity.vehicle import CombustionVehicle, ElectricVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    payload = json.load(open(CADDY_DIESEL_SAMPLE, "r", encoding="utf-8"))
+    payload["vin"] = VIN
+    connector._map_dataset(VIN, Dataset.from_json(payload))  # pylint: disable=protected-access
+    v = garage.get_vehicle(VIN)
+
+    assert isinstance(v, CombustionVehicle) and not isinstance(v, ElectricVehicle)
+    assert str(v.type.value) == "Type.DIESEL"
+    assert list(v.drives.drives) == ["primary"]
+    primary = v.drives.drives["primary"]
+    assert isinstance(primary, DieselDrive)
+    assert primary.range.value == 130 and primary.level.value == 22
+
+
+def test_petrol_vehicle_type_stays_gasoline_with_empty_scr_range(connector):
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "b", "dataFieldName": "scr_range", "value": ""},
+    ]})
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.GASOLINE"
+
+
 def test_petrol_empty_scr_range_stays_combustion_no_crash(connector):
     """Petrol/PHEV cars also carry the scr_range field but report it as an empty
     string. That must NOT be read as diesel (no DieselDrive) and must not raise."""
