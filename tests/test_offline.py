@@ -1092,6 +1092,50 @@ def test_diesel_vehicle_type_is_diesel(connector):
     assert str(garage.get_vehicle(VIN).type.value) == "Type.DIESEL"
 
 
+def test_diesel_evidence_in_a_later_dataset_updates_vehicle_type(connector):
+    """A combustion vehicle typed gasoline by an earlier dataset without
+    scr_range is no longer promoted, so a later numeric scr_range must still
+    turn its type into diesel."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+    ]}))
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.GASOLINE"
+
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "fuel_level_current_level", "value": "52"},
+        {"key": "b", "dataFieldName": "scr_range", "value": "10000"},
+    ]}))
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.DIESEL"
+
+
+def test_diesel_evidence_does_not_retype_a_hybrid(connector):
+    """A PHEV keeps its hybrid type even when a dataset carries a numeric
+    scr_range."""
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "state_of_charge", "value": "25"},
+        {"key": "b", "dataFieldName": "fuel_level_current_level", "value": "37"},
+        {"key": "c", "dataFieldName": "scr_range", "value": "10000"},
+    ]}))
+    assert str(garage.get_vehicle(VIN).type.value) == "Type.HYBRID"
+
+
+def test_valueless_primary_range_alone_is_not_an_ev(connector):
+    """The flat-format EV fallback must ignore a cruising_range_primary_engine
+    entry that carries no value."""
+    from carconnectivity.vehicle import ElectricVehicle
+    garage = connector.car_connectivity.garage
+    garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))
+    connector._map_dataset(VIN, Dataset.from_json({"vin": VIN, "Data": [  # pylint: disable=protected-access
+        {"key": "a", "dataFieldName": "cruising_range_primary_engine",
+         "timestampUtc": "2026-11-07T15:34:46.000Z"},
+    ]}))
+    assert not isinstance(garage.get_vehicle(VIN), ElectricVehicle)
+
+
 def test_petrol_vehicle_type_stays_gasoline_with_empty_scr_range(connector):
     garage = connector.car_connectivity.garage
     garage.add_vehicle(VIN, VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector))

@@ -1078,7 +1078,7 @@ class Connector(BaseConnector):
         # A pure EV in flat format reports only cruising_range_primary_engine (its
         # electric range) with no fuel fields; treat that as electric.
         if not has_electric and not has_fuel \
-                and dataset.by_field('cruising_range_primary_engine') is not None:
+                and dataset.value_of('cruising_range_primary_engine') is not None:
             has_electric = True
 
         # "already" tests the CarConnectivity base capabilities (HybridVehicle is
@@ -1092,8 +1092,6 @@ class Connector(BaseConnector):
             already = isinstance(vehicle, ElectricVehicle)
         elif has_fuel:
             desired, desired_type = VWEudaCombustionVehicle, GenericVehicle.Type.GASOLINE
-            if _is_diesel(dataset):
-                desired_type = GenericVehicle.Type.DIESEL
             already = isinstance(vehicle, CombustionVehicle)
         else:
             desired, desired_type, already = None, None, True
@@ -1102,6 +1100,12 @@ class Connector(BaseConnector):
             vehicle = desired(garage=garage, origin=vehicle)
             garage.replace_vehicle(vin, vehicle)
             vehicle.type._set_value(desired_type)  # pylint: disable=protected-access
+        # Diesel evidence can arrive after the vehicle was already promoted to a
+        # (gasoline-typed) combustion vehicle, so check it on every dataset. A
+        # hybrid keeps its type.
+        if _is_diesel(dataset) and isinstance(vehicle, CombustionVehicle) \
+                and not isinstance(vehicle, ElectricVehicle):
+            vehicle.type._set_value(GenericVehicle.Type.DIESEL)  # pylint: disable=protected-access
         is_phev = has_electric and has_fuel
 
         # Dataset freshness, exposed PER VEHICLE: one connector serves several VINs,
