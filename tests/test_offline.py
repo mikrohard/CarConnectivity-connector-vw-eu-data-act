@@ -1824,6 +1824,83 @@ def test_login_marketing_consent_with_unusable_callback_is_reported(callback):
     assert [url.split("?", 1)[0] for url, _ in client.gets] == [MARKETING_PAGE]
 
 
+# v2 single-page marketing consent (SEAT/CUPRA after Auth0, TommiG1/HA_VAG-EU-Data-Act#76).
+MARKETING_V2_PAGE = IDENTITY + "/v2/login/ui/marketing-consent"
+MARKETING_V2_SKIP = MARKETING_V2_PAGE + "/skip"
+
+
+def _record_posts(client, routes):
+    """Answer the client's POSTs from ``routes`` (url -> response) and record them."""
+    client.posts = []
+
+    def _post(url, **kwargs):
+        client.posts.append((url, kwargs))
+        return routes[url]
+
+    client._session.post = _post
+
+
+def test_login_skips_marketing_consent_v2_without_consenting():
+    """The v2 page carries no callback: the skip is a POST of relayState and
+    state to .../marketing-consent/skip (what the browser's Skip button does),
+    then the chain carries on to the portal callback."""
+    identity_callback = IDENTITY + "/oidc/v1/oauth/client/callback"
+    client = _login_client({
+        MARKETING_V2_PAGE: _FakeResp(MARKETING_V2_PAGE + "?relayState=r1&state=s1"),
+        identity_callback: _redirect(identity_callback, CALLBACK_URL),
+        PORTAL + "/services/callbacklogin": _callback_resp(),
+    })
+    _record_posts(client, {MARKETING_V2_SKIP: _redirect(MARKETING_V2_SKIP, identity_callback + "?code=y")})
+    start = _redirect(IDENTITY + "/u/login/password", MARKETING_V2_PAGE + "?relayState=r1&state=s1")
+
+    client._finish_login(client._follow_login_redirects(start))  # pylint: disable=protected-access
+
+    assert len(client.posts) == 1
+    url, kwargs = client.posts[0]
+    assert url == MARKETING_V2_SKIP
+    assert kwargs["data"] == {"relayState": "r1", "state": "s1"}
+    assert kwargs["allow_redirects"] is False
+    assert kwargs["headers"]["Origin"] == IDENTITY
+
+
+def test_login_marketing_consent_v2_shown_again_is_reported():
+    """The skip is tried once per chain: landing on the page again ends on a
+    consent message, not a loop and not "check email and password"."""
+    page = MARKETING_V2_PAGE + "?relayState=r1&state=s1"
+    client = _login_client({MARKETING_V2_PAGE: _FakeResp(page)})
+    _record_posts(client, {MARKETING_V2_SKIP: _redirect(MARKETING_V2_SKIP, page)})
+    start = _redirect(IDENTITY + "/u/login/password", page)
+
+    with pytest.raises(AuthError, match=r"consent question \(marketing\)") as excinfo:
+        client._finish_login(client._follow_login_redirects(start))  # pylint: disable=protected-access
+    assert len(client.posts) == 1
+    assert "r1" not in str(excinfo.value)
+
+
+@pytest.mark.parametrize("query", ["", "?relayState=r1", "?state=s1"])
+def test_login_marketing_consent_v2_without_parameters_is_reported(query):
+    """Without both relayState and state there is nothing to skip with: the
+    page is reported as a consent question and nothing is POSTed."""
+    client = _login_client({MARKETING_V2_PAGE: _FakeResp(MARKETING_V2_PAGE + query)})
+    _record_posts(client, {})
+    start = _redirect(IDENTITY + "/u/login/password", MARKETING_V2_PAGE + query)
+
+    with pytest.raises(AuthError, match=r"consent question \(marketing\)"):
+        client._finish_login(client._follow_login_redirects(start))  # pylint: disable=protected-access
+    assert not client.posts
+
+
+def test_marketing_consent_v2_skip_only_on_identity_host():
+    """Only the https page on the identity host is skipped."""
+    from carconnectivity_connectors.vw_eu_data_act.client import _marketing_consent_v2_skip  # pylint: disable=import-outside-toplevel
+
+    assert _marketing_consent_v2_skip(MARKETING_V2_PAGE + "?relayState=r&state=s") == (
+        MARKETING_V2_SKIP, {"relayState": "r", "state": "s"})
+    assert _marketing_consent_v2_skip("https://example.org/v2/login/ui/marketing-consent?relayState=r&state=s") is None
+    assert _marketing_consent_v2_skip("http://identity.vwgroup.io/v2/login/ui/marketing-consent?relayState=r&state=s") is None
+    assert _marketing_consent_v2_skip(MARKETING_V2_SKIP + "?relayState=r&state=s") is None
+
+
 @pytest.mark.parametrize("location", [
     "https://attacker.example/content/euda/de/de/user.html",
     "http://eu-data-act.drivesomethinggreater.com/services/callbacklogin",
