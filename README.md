@@ -149,6 +149,13 @@ something newer than the clock itself (#44). A value that does change under an u
 is still taken, with its measurement time kept. When a dataset carries no capture time at all, the
 delivery's `createdOn` is used as the measurement time rather than leaving it to the clock.
 
+**A sentinel is not a reading.** Instead of leaving a field out, the portal sometimes fills it with
+an integer maximum meaning "no reading": `2147483647`, `4294967295`, and since late October 2026
+`4294967294` on the flat `mileage` field. Those values are skipped on every field, so the previous
+reading stays in place and the odometer never jumps to four billion km. `65535` is not treated
+that way globally, since it is a plausible odometer value. Only flat `remaining_charging_time`
+treats it as "no value".
+
 ### Vehicle
 
 | EU Data Act field | CarConnectivity attribute | Notes |
