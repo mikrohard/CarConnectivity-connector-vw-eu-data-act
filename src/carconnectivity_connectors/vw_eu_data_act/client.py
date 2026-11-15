@@ -366,6 +366,33 @@ def _marketing_consent_callback(url: str) -> Optional[str]:
     return target._replace(query=urlencode(parse_qsl(target.query, keep_blank_values=True))).geturl()
 
 
+def _marketing_consent_v2_skip(url: str) -> Optional[Tuple[str, Dict[str, str]]]:
+    """Return ``(skip_url, form)`` for the v2 marketing consent page, else None.
+
+    Since late October 2026 SEAT and CUPRA accounts land, after the Auth0
+    sign-in, on the single-page ``/v2/login/ui/marketing-consent?relayState=..
+    &state=..``. That page has no ``callback`` parameter: the browser's Skip
+    button POSTs ``relayState`` and ``state`` to ``.../marketing-consent/skip``
+    (TommiG1/HA_VAG-EU-Data-Act#76, confirmed on SEAT and CUPRA). Skipping
+    gives no consent on the account holder's behalf. Only an https page on the
+    identity host carrying both parameters qualifies; anything else returns
+    None and the page is reported by _finish_login.
+    """
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    if (parsed.scheme != "https" or parsed.netloc.lower() != IDENTITY_HOST
+            or not path.endswith("/login/ui/marketing-consent")):
+        return None
+    query = parse_qs(parsed.query)
+    relay = (query.get("relayState") or [""])[0]
+    state = (query.get("state") or [""])[0]
+    if not relay or not state:
+        LOG.debug("login: v2 marketing consent page without relayState/state")
+        return None
+    skip_url = parsed._replace(path=path + "/skip", query="", fragment="").geturl()
+    return skip_url, {"relayState": relay, "state": state}
+
+
 def _extract_vins(payload) -> List[dict]:
     """Best-effort extraction of vehicles from the (undocumented) vehicles body.
 
@@ -513,11 +540,25 @@ class EudaApiClient:
         2026): at most MAX_LOGIN_REDIRECTS hops, https on the identity or
         portal host only, stop at the /services/callbacklogin response (it
         sets the session cookie) without fetching the localized CMS page it
-        redirects to, and skip the optional marketing consent page through its
-        callback. Returns the response the chain stopped on.
+        redirects to, and skip the optional marketing consent page: the classic
+        one through its callback, the v2 one (SEAT/CUPRA after Auth0) by POSTing
+        to its skip endpoint like the browser's Skip button, once per chain.
+        Returns the response the chain stopped on.
         """
+        skipped_v2 = False
         for _ in range(MAX_LOGIN_REDIRECTS):
-            if _is_portal_callback(resp.url) or resp.status_code not in LOGIN_REDIRECT_STATUSES:
+            if _is_portal_callback(resp.url):
+                return resp
+            skip = None if skipped_v2 or resp.status_code >= 400 else _marketing_consent_v2_skip(resp.url)
+            if skip:
+                skip_url, form = skip
+                LOG.info("Login: skipping the optional marketing consent page without consenting")
+                resp = self._session.post(skip_url, data=form,
+                                          headers={"Referer": resp.url, "Origin": IDENTITY_BASE},
+                                          allow_redirects=False, timeout=self._timeout)
+                skipped_v2 = True
+                continue
+            if resp.status_code not in LOGIN_REDIRECT_STATUSES:
                 return resp
             location = resp.headers.get("Location")
             if not location:
@@ -592,6 +633,14 @@ class EudaApiClient:
         # never answered here; the message names its kind but not the URL,
         # which carries the user id.
         path_segments = urlparse(landing).path.split("/")
+        if "marketing-consent" in path_segments:
+            # v2 page that could not be skipped (no relayState/state, or shown
+            # again after the skip).
+            raise AuthError(
+                "Login interrupted: the identity provider asks this account a consent question "
+                f"(marketing). Complete one login in a browser at {BASE_URL} and answer it. "
+                "See connector issue #49."
+            )
         if "signin-service" in path_segments and "consent" in path_segments:
             kind_index = path_segments.index("consent") + 1
             kind = path_segments[kind_index] if kind_index < len(path_segments) else ""
