@@ -1559,6 +1559,75 @@ def test_odometer_prefers_highest_slot(connector):
     assert garage.get_vehicle(VIN).odometer.value == 70908
 
 
+# Real "no reading" slot from TommiG1/HA_VAG-EU-Data-Act#70 (SEAT, flat format):
+# one below the uint32 maximum, fresher than the real reading next to it.
+MILEAGE_SENTINEL_SLOT = {"key": "41c0805c-43e5-313e-9dfb-356cb8d20f7c", "dataFieldName": "mileage",
+                         "value": "4294967294", "timestampUtc": "2026-10-24T07:24:13.000Z"}
+
+
+def test_odometer_ignores_mileage_sentinel(connector):
+    """A fresher 4294967294 slot must not become the odometer (it would win the
+    highest-slot pick and spike the history): the real reading stays."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        MILEAGE_SENTINEL_SLOT,
+        {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage",
+         "value": "12345", "timestampUtc": "2026-10-23T18:00:00.000Z"},
+    ]})
+
+    connector._map_dataset(VIN, ds)  # pylint: disable=protected-access
+
+    assert garage.get_vehicle(VIN).odometer.value == 12345
+
+
+def test_odometer_left_unset_when_only_sentinel(connector):
+    """A dataset whose only mileage is a sentinel maps no odometer at all."""
+    garage = connector.car_connectivity.garage
+    vehicle = VWEudaVehicle(vin=VIN, garage=garage, managing_connector=connector)
+    garage.add_vehicle(VIN, vehicle)
+
+    connector._map_dataset(VIN, Dataset.from_json(  # pylint: disable=protected-access
+        {"vin": VIN, "Data": [MILEAGE_SENTINEL_SLOT]}))
+
+    assert garage.get_vehicle(VIN).odometer.value is None
+
+
+@pytest.mark.parametrize("raw", ["2147483647", "4294967294", "4294967295"])
+def test_value_accessors_skip_sentinels(raw):
+    """Every value accessor treats the int32/uint32 sentinels as "no reading"."""
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k1", "dataFieldName": "mileage.value", "value": raw},
+        {"key": "k2", "dataFieldName": "energy_contents.current_energy_content.value", "value": raw},
+    ]})
+    assert ds.value_of('mileage.value') is None
+    assert ds.freshest_max_value_of('mileage.value') is None
+    assert ds.value_by_key('k1') is None
+    assert ds.freshest_numeric_by_prefix('energy_contents.current_energy_content') is None
+    # The field is still inventoried (diagnostics, unmapped-field counts).
+    assert 'mileage.value' in ds.field_names
+
+
+def test_65535_is_not_a_global_sentinel():
+    """65535 km is a real odometer reading; only flat remaining_charging_time
+    treats 65535 as "no value", where it is mapped."""
+    ds = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "k1", "dataFieldName": "mileage.value", "value": "65535"}]})
+    assert ds.freshest_max_value_of('mileage.value') == 65535
+
+
+def test_merge_keeps_real_reading_over_newer_sentinel():
+    """Merging datasets keeps an older real reading over a newer sentinel."""
+    older = Dataset.from_json({"vin": VIN, "Data": [
+        {"key": "aaaaaaaa-0000-0000-0000-000000000000", "dataFieldName": "mileage",
+         "value": "12345", "timestampUtc": "2026-10-23T18:00:00.000Z"}]})
+    newer = Dataset.from_json({"vin": VIN, "Data": [MILEAGE_SENTINEL_SLOT]})
+
+    assert Dataset.merge([older, newer]).value_of('mileage') == 12345
+
+
 # --- login verdict (issues #29, #49 and VW's October 2026 login changes) ------
 
 PORTAL = "https://eu-data-act.drivesomethinggreater.com"

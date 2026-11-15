@@ -198,6 +198,23 @@ def resolve_enum_index(field_name: str, value):
     return value
 
 
+# Integer values the portal sends for "no reading" instead of leaving the field
+# out: the int32/uint32 maxima, and 4294967294 (uint32 max - 1), which the flat
+# ``mileage`` field has carried since late October 2026 (TommiG1/HA_VAG-EU-Data-
+# Act#70, a SEAT). No real reading comes near them, so they are dropped on every
+# field. 65535 (uint16 max) is deliberately NOT global: it is a plausible
+# odometer value, and the one field known to use it as "no value" (flat
+# remaining_charging_time) already filters it where it is mapped.
+NUMERIC_SENTINELS = frozenset({2**31 - 1, 2**32 - 2, 2**32 - 1})
+
+
+def is_sentinel(value) -> bool:
+    """Whether ``value`` is a portal "no reading" sentinel (see NUMERIC_SENTINELS)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value in NUMERIC_SENTINELS
+
+
 def parse_timestamp(raw: Optional[str]) -> Optional[datetime]:
     """Parse the various timestamp encodings seen in datasets."""
     s = (raw or "").strip()
@@ -238,6 +255,16 @@ class DataPoint:
         mapping (which keys off the label string) keeps working.
         """
         return resolve_enum_index(self.field_name, parse_value(self.raw_value))
+
+    @property
+    def is_reading(self) -> bool:
+        """Whether this point carries a reading (False for a "no reading" sentinel).
+
+        Sentinel points are kept in :attr:`Dataset.points` (so field inventories
+        still list the field) but every value accessor skips them, so an older
+        real reading or nothing at all wins over a sentinel.
+        """
+        return not is_sentinel(self.value)
 
 
 # Dotted report fields that the official continuous data dictionary (v1.0.0,
@@ -404,9 +431,9 @@ class Dataset:
 
         Known charging-job copies (``REPORT_COPY_KEYS``) are only a fallback
         when no other reading of the field is present, and never one for
-        ``REPORT_COPIES_DIFFER``.
+        ``REPORT_COPIES_DIFFER``. "No reading" sentinels are never returned.
         """
-        matches = [dp for dp in self.points.values() if dp.field_name == field_name]
+        matches = [dp for dp in self.points.values() if dp.field_name == field_name and dp.is_reading]
         if field_name in REPORT_COPY_KEYS:
             live = [dp for dp in matches if not _is_report_copy(dp)]
             if live or field_name in REPORT_COPIES_DIFFER:
@@ -431,9 +458,10 @@ class Dataset:
         return self.points.get(key)
 
     def value_by_key(self, key: str):
-        """Return the typed value of the point with ``key`` or ``None``."""
+        """Return the typed value of the point with ``key`` or ``None``
+        (also ``None`` for a "no reading" sentinel)."""
         dp = self.by_key(key)
-        return dp.value if dp is not None else None
+        return dp.value if dp is not None and dp.is_reading else None
 
     def freshest_numeric_by_prefix(self, prefix: str):
         """Return a numeric value among fields whose name starts with ``prefix``.
@@ -445,7 +473,7 @@ class Dataset:
         the same stable choice as :meth:`by_field`.
         """
         matches = [dp for dp in self.points.values()
-                   if dp.field_name.startswith(prefix)
+                   if dp.field_name.startswith(prefix) and dp.is_reading
                    and isinstance(dp.value, (int, float)) and not isinstance(dp.value, bool)]
         return min(matches, key=lambda dp: dp.key).value if matches else None
 
@@ -459,8 +487,10 @@ class Dataset:
         tie-break in :meth:`by_field` can then pick the lower reading, making a
         monotonic field like the odometer momentarily read low. Used for the
         odometer; ``by_field``/``value_of`` keep their stable behaviour elsewhere.
+        "No reading" sentinels are skipped first: as the largest values they would
+        otherwise always win the max (e.g. mileage 4294967294).
         """
-        matches = [dp for dp in self.points.values() if dp.field_name == field_name]
+        matches = [dp for dp in self.points.values() if dp.field_name == field_name and dp.is_reading]
         if not matches:
             return None
 
