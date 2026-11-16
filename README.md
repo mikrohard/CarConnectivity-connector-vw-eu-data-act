@@ -8,7 +8,9 @@
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/carconnectivity-connector-vw-eu-data-act)](https://pypi.org/project/carconnectivity-connector-vw-eu-data-act/)
 
 A [CarConnectivity](https://github.com/tillsteinbach/CarConnectivity) connector that reads vehicle
-data from the **VW Group EU Data Act portal** (`eu-data-act.drivesomethinggreater.com`). It supports
+data from the **VW Group EU Data Act portal** (`eu-data-act.vwgroup-datahub.com`, formerly
+`eu-data-act.drivesomethinggreater.com`). If VW moves the portal again to another of its hosts, the
+connector follows the permanent redirect on its own and logs a warning. It supports
 every VW Group brand on the portal (Volkswagen, Audi, Škoda, SEAT, Cupra, Bentley) and models pure
 EVs, combustion and **PHEV** drivetrains.
 
@@ -35,7 +37,7 @@ vehicle on the EU Data Act portal. The connector only *downloads* the datasets t
 generates — it cannot create the data request for you, and without an active request there will be
 nothing to fetch.
 
-1. Open <https://eu-data-act.drivesomethinggreater.com/> and **log in** with your Volkswagen ID
+1. Open <https://eu-data-act.vwgroup-datahub.com/> and **log in** with your Volkswagen ID
    (the same email/password you'll use in the connector config).
 2. Go to **Data clusters → Vehicle overview**.
 3. **Connect your car** to the site if it isn't already listed (follow the on-screen

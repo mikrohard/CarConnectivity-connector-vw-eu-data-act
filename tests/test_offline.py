@@ -27,7 +27,7 @@ import requests
 from carconnectivity.units import Energy, Length, Speed
 
 from carconnectivity_connectors.vw_eu_data_act.brands import BRANDS
-from carconnectivity_connectors.vw_eu_data_act.client import ApiError, AuthError, EudaApiClient
+from carconnectivity_connectors.vw_eu_data_act.client import ApiError, AuthError, EudaApiClient, PortalMovedError
 from carconnectivity_connectors.vw_eu_data_act.connector import (
     Connector, _filename_timestamp, KNOWN_MAPPED_FIELDS,
     _charge_mode, _charge_mode_flat, VWEudaChargeMode,
@@ -1630,7 +1630,7 @@ def test_merge_keeps_real_reading_over_newer_sentinel():
 
 # --- login verdict (issues #29, #49 and VW's October 2026 login changes) ------
 
-PORTAL = "https://eu-data-act.drivesomethinggreater.com"
+PORTAL = "https://eu-data-act.vwgroup-datahub.com"
 IDENTITY = "https://identity.vwgroup.io"
 CALLBACK_URL = PORTAL + "/services/callbacklogin?state=ch__en__VOLKSWAGEN_PASSENGER_CARS&code=x"
 USER_PAGE = PORTAL + "/content/euda/ch/en/user.html"
@@ -1912,6 +1912,142 @@ def test_login_redirect_to_unexpected_location_fails(location):
     with pytest.raises(AuthError, match="unexpected location"):
         client._follow_login_redirects(start)  # pylint: disable=protected-access
     assert not client.gets
+
+
+# --- portal host move (issue #67: drivesomethinggreater.com -> vwgroup-datahub.com) --
+
+LEGACY_PORTAL = "https://eu-data-act.drivesomethinggreater.com"
+MOVED_PORTAL = "https://eu-data-act2.vwgroup-datahub.com"
+
+
+def test_client_targets_the_new_portal_host():
+    """The portal now lives on vwgroup-datahub.com: the OIDC redirect_uri and the
+    API calls use it (on the old host, 0.3.4 failed with "unexpected location")."""
+    client = _login_client()
+    assert client.base_url == PORTAL
+    assert "redirect_uri=" + urlencode({"": PORTAL + "/login"})[1:] in client._build_authorize_url()  # pylint: disable=protected-access
+
+
+def test_login_chain_may_cross_the_legacy_portal_host():
+    """The old host is VW's and only redirects: a chain crossing it is followed."""
+    client = _login_client({
+        LEGACY_PORTAL + "/login": _FakeResp(LEGACY_PORTAL + "/login", status_code=301,
+                                            headers={"Location": CALLBACK_URL}),
+        PORTAL + "/services/callbacklogin": _callback_resp(),
+    })
+    start = _redirect(IDENTITY + "/oidc/v1/oauth/client/callback", LEGACY_PORTAL + "/login?code=y")
+    client._finish_login(client._follow_login_redirects(start))  # pylint: disable=protected-access
+
+
+def test_login_detects_a_portal_move():
+    """A permanent redirect from the portal to another VW portal host is a move,
+    not an attack: it is reported as such, with only the new host kept."""
+    client = _login_client({
+        PORTAL + "/login": _FakeResp(PORTAL + "/login?code=y", status_code=301,
+                                     headers={"Location": MOVED_PORTAL + "/somewhere/else?code=y"}),
+    })
+    start = _redirect(IDENTITY + "/oidc/v1/oauth/client/callback", PORTAL + "/login?code=y")
+    with pytest.raises(PortalMovedError) as excinfo:
+        client._follow_login_redirects(start)  # pylint: disable=protected-access
+    assert excinfo.value.base_url == MOVED_PORTAL
+
+
+def test_login_starts_over_on_the_new_host_after_a_move(monkeypatch):
+    """login() switches host and runs the login once more, now with the new
+    redirect_uri, and says so in the log."""
+    from carconnectivity_connectors.vw_eu_data_act import client as client_module  # pylint: disable=import-outside-toplevel
+    warnings = []
+    monkeypatch.setattr(client_module.LOG, "warning", lambda msg, *args: warnings.append(msg % args))
+    client = _login_client()
+    redirect_uris = []
+
+    def _do_login():
+        redirect_uris.append(client._build_authorize_url())  # pylint: disable=protected-access
+        if len(redirect_uris) == 1:
+            raise PortalMovedError(MOVED_PORTAL)
+
+    client._do_login = _do_login
+    client.login()
+
+    assert client.base_url == MOVED_PORTAL
+    assert urlencode({"": MOVED_PORTAL + "/login"})[1:] in redirect_uris[1]
+    assert any("moved from " + PORTAL + " to " + MOVED_PORTAL in w for w in warnings)
+
+
+def test_login_gives_up_when_the_portal_moves_twice():
+    """A second move right after the first is not followed (no host hopping)."""
+    client = _login_client()
+
+    def _do_login():
+        raise PortalMovedError(MOVED_PORTAL if client.base_url == PORTAL else "https://x.vwgroup-datahub.com")
+
+    client._do_login = _do_login
+    with pytest.raises(PortalMovedError):
+        client.login()
+
+
+@pytest.mark.parametrize("status, location, expected", [
+    (301, MOVED_PORTAL + "/login", MOVED_PORTAL),
+    (308, "https://euda.vwgroup-datahub.com/x", "https://euda.vwgroup-datahub.com"),
+    (302, MOVED_PORTAL + "/login", None),                       # temporary: not a move
+    (301, "http://eu-data-act2.vwgroup-datahub.com/login", None),  # not https
+    (301, "https://eu-data-act2.vwgroup-datahub.com:8443/login", None),  # explicit port
+    (301, "https://evilvwgroup-datahub.com/login", None),       # lookalike domain
+    (301, "https://example.org/login", None),                   # foreign domain
+    (301, LEGACY_PORTAL + "/login", None),                      # back to the legacy host
+    (301, PORTAL + "/elsewhere", None),                         # same host
+])
+def test_portal_move_target(status, location, expected):
+    from carconnectivity_connectors.vw_eu_data_act.client import (  # pylint: disable=import-outside-toplevel
+        PORTAL_HOST, _portal_move_target)
+    resp = _FakeResp(PORTAL + "/login", status_code=status, headers={"Location": location})
+    assert _portal_move_target(resp, PORTAL_HOST) == expected
+
+
+def test_portal_move_is_only_announced_by_the_portal():
+    """The identity provider redirecting to a portal-domain host is not a move."""
+    from carconnectivity_connectors.vw_eu_data_act.client import (  # pylint: disable=import-outside-toplevel
+        PORTAL_HOST, _portal_move_target)
+    resp = _FakeResp(IDENTITY + "/x", status_code=301, headers={"Location": MOVED_PORTAL + "/login"})
+    assert _portal_move_target(resp, PORTAL_HOST) is None
+
+
+def test_unexpected_portal_domain_redirect_hints_at_a_move():
+    """A non-permanent redirect to an unknown VW portal host is refused, but the
+    message points at a probable portal move so the cause is obvious next time."""
+    client = _login_client()
+    start = _redirect(IDENTITY + "/oidc/v1/oauth/client/callback", MOVED_PORTAL + "/login")
+    with pytest.raises(AuthError, match="portal may have moved"):
+        client._follow_login_redirects(start)  # pylint: disable=protected-access
+
+
+def test_api_call_follows_a_portal_move(monkeypatch):
+    """The old host rewrites API paths behind its 301 (e.g. /proxy_api/euda-apim
+    -> /euda-b2u) and those answer 404, which looked like "no data" (#67). The
+    first hop of the redirect history reveals the move: the client switches
+    host, logs in there and repeats the request on the same path."""
+    client = EudaApiClient(email="user@example.com", password="secret")
+    path = "/proxy_api/euda-apim/datadelivery/vehicles/VIN1/id/list"
+    hop = _FakeResp(PORTAL + path, status_code=301,
+                    headers={"Location": MOVED_PORTAL + "/euda-b2u/datadelivery/vehicles/VIN1/id/list"})
+    rewritten_404 = _http_response(404)
+    rewritten_404.history = [hop]
+    ok = _http_response(200)
+    ok._content = b'[{"name": "a.zip", "createdOn": "2026-11-16T10:00:00Z"}]'  # pylint: disable=protected-access
+    requested = []
+
+    def _session_get(url, *, headers=None):
+        requested.append(url)
+        return rewritten_404 if len(requested) == 1 else ok
+
+    logins = []
+    monkeypatch.setattr(client, "_session_get", _session_get)
+    monkeypatch.setattr(client, "login", lambda: logins.append(client.base_url))
+    monkeypatch.setattr(client, "ensure_login", lambda: None)
+
+    assert client.list_datasets("VIN1", "id") == [{"name": "a.zip", "createdOn": "2026-11-16T10:00:00Z"}]
+    assert requested == [PORTAL + path, MOVED_PORTAL + path]
+    assert logins == [MOVED_PORTAL]
 
 
 def test_login_redirect_loop_is_bounded():
